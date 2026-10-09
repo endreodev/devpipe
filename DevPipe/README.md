@@ -104,6 +104,10 @@ As ferramentas de edição dos agentes de IA trabalham em UTF-8. Em projetos ANS
 
 **Branches corrompidas por versões anteriores:** abra a demanda → aba *Alterações (diff)* → **Reparar acentuação / codificação**. O reparo também é aplicado automaticamente ao Retomar ou Devolver para ajustes.
 
+## 4.2 Fazenda da Esteira (painel de TV)
+
+Menu **Fazenda (TV)** (ou `/fazenda.html`): painel animado em pixel art que mostra a esteira como uma fazenda, em que cada demanda é uma plantação, o Claude e você são os fazendeiros e o clima indica a saúde da esteira. `?demo=1` mostra dados fictícios para apresentação. Detalhes em `docs/FAZENDA.md`.
+
 ## 5. Projeto de demonstração
 
 `demo/loja-demo` é um projeto JavaScript sem dependências (usa só o Node, que qualquer instalação do Claude Code via npm já tem; com o instalador nativo, instale o Node 18+ para rodar os testes do demo). `demo/demanda-exemplo/CH-1001-cupom-desconto.docx` é a especificação de uma demanda real.
@@ -137,7 +141,8 @@ internal/docs/          extração de PDF/DOCX/DOC/TXT/MD e classificação de i
 internal/encx/          proteção de codificação (Windows-1252 ⇄ UTF-8, BOM, CRLF, reparo de '�')
 internal/rules/         composição das regras com precedência e hash de versão
 internal/security/      diretórios autorizados, redação de segredos, classificação de comandos
-internal/web/           API REST, SSE (tempo real) e interface embutida (static/)
+internal/fazenda/       regras e métricas do painel Fazenda da Esteira
+internal/web/           API REST, SSE (tempo real) e interface embutida (static/, inclui Phaser 3)
 demo/                   projeto e demanda de demonstração
 docs/ARQUITETURA.md     decisões técnicas, arquitetura, modelo de dados e segurança
 ```

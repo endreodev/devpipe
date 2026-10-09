@@ -583,3 +583,85 @@ func (s *Store) Stats() (Stats, error) {
 	s.db.QueryRow(`SELECT COUNT(*) FROM projects`).Scan(&st.Projects)
 	return st, nil
 }
+
+// ---------- Fazenda (painel de TV) ----------
+
+// StageEnteredAt devolve, por demanda, o instante da última mudança de etapa
+// registrada no histórico de eventos.
+func (s *Store) StageEnteredAt() (map[int64]time.Time, error) {
+	rows, err := s.db.Query(`SELECT demand_id, MAX(time) FROM events
+		WHERE demand_id > 0 AND kind IN ('etapa','bloqueio','ajustes','concluido','movimentacao','cadastro','limite_plano')
+		GROUP BY demand_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]time.Time{}
+	for rows.Next() {
+		var id int64
+		var raw any
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		if t, ok := parseDBTime(raw); ok {
+			out[id] = t
+		}
+	}
+	return out, rows.Err()
+}
+
+// Delivery é uma conclusão (aprovação na revisão humana) registrada.
+type Delivery struct {
+	DemandID int64
+	At       time.Time
+}
+
+func (s *Store) DeliveriesSince(since time.Time) ([]Delivery, error) {
+	rows, err := s.db.Query(`SELECT demand_id, time FROM events WHERE kind='concluido' AND demand_id > 0 AND time >= ? ORDER BY time`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Delivery
+	for rows.Next() {
+		var d Delivery
+		if err := rows.Scan(&d.DemandID, &d.At); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// SpecSizes devolve o tamanho (em caracteres) da especificação da revisão atual.
+func (s *Store) SpecSizes() (map[int64]int, error) {
+	rows, err := s.db.Query(`SELECT r.demand_id, LENGTH(r.spec) FROM revisions r JOIN demands d ON d.id=r.demand_id AND d.current_revision=r.number`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int{}
+	for rows.Next() {
+		var id int64
+		var n sql.NullInt64
+		rows.Scan(&id, &n)
+		out[id] = int(n.Int64)
+	}
+	return out, rows.Err()
+}
+
+func parseDBTime(v any) (time.Time, bool) {
+	switch x := v.(type) {
+	case time.Time:
+		return x, true
+	case string:
+		for _, f := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999Z07:00", "2006-01-02 15:04:05"} {
+			if t, err := time.Parse(f, x); err == nil {
+				return t, true
+			}
+		}
+	case []byte:
+		return parseDBTime(string(x))
+	}
+	return time.Time{}, false
+}

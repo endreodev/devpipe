@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fazenda da Esteira — DevPipe</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%235fae3b'/%3E%3Crect x='7' y='3' width='2' height='9' fill='%232f6d2a'/%3E%3Crect x='4' y='5' width='3' height='2' fill='%239bd46a'/%3E%3Crect x='9' y='7' width='3' height='2' fill='%239bd46a'/%3E%3C/svg%3E">
+<style>
+  html, body { margin: 0; height: 100%; background: #14210f; overflow: hidden; }
+  #jogo { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  #voltar { position: fixed; left: 8px; bottom: 8px; font: 12px system-ui, sans-serif; color: #cfe8c0; background: rgba(0,0,0,.45);
+    padding: 4px 8px; border-radius: 4px; text-decoration: none; opacity: 0; transition: opacity .3s; }
+  body:hover #voltar { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="jogo"></div>
+<a id="voltar" href="/">← DevPipe</a>
+<script src="vendor/phaser.min.js"></script>
+<script src="fazenda.js"></script>
+</body>
+</html>

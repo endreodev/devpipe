@@ -23,6 +23,7 @@ import (
 	"devpipe/internal/docs"
 	"devpipe/internal/domain"
 	"devpipe/internal/encx"
+	"devpipe/internal/fazenda"
 	"devpipe/internal/gitx"
 	"devpipe/internal/pipeline"
 	"devpipe/internal/provider"
@@ -34,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.1.4"
+const Version = "0.2.0"
 
 type Server struct {
 	st      *store.Store
@@ -87,6 +88,7 @@ func (s *Server) Handler() http.Handler {
 
 	h("GET /api/meta", s.meta)
 	h("GET /api/stats", func(w http.ResponseWriter, r *http.Request) (any, error) { return s.st.Stats() })
+	h("GET /api/fazenda", s.fazenda)
 
 	h("GET /api/projects", func(w http.ResponseWriter, r *http.Request) (any, error) { return s.st.ListProjects() })
 	h("POST /api/projects/inspect", s.inspectProject)
@@ -887,4 +889,24 @@ func displayText(s string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// fazenda devolve o estado do painel "Fazenda da Esteira" (somente leitura).
+func (s *Server) fazenda(w http.ResponseWriter, r *http.Request) (any, error) {
+	settings, _ := s.st.GetSettings()
+	ds, err := s.st.ListDemands(store.DemandFilter{})
+	if err != nil {
+		return nil, err
+	}
+	entrou, _ := s.st.StageEnteredAt()
+	sizes, _ := s.st.SpecSizes()
+	now := time.Now()
+	dels, _ := s.st.DeliveriesSince(now.AddDate(0, 0, -8))
+	in := fazenda.Entrada{Demandas: ds, EntrouNaEtapa: entrou, SpecSizes: sizes, Running: s.eng.IsRunning}
+	for _, d := range dels {
+		in.Entregas = append(in.Entregas, fazenda.Entrega{DemandID: d.DemandID, At: d.At})
+	}
+	est := fazenda.Calcular(in, fazenda.Default(settings.MaxParallel), now, time.Local)
+	u, paused := s.eng.Usage()
+	return map[string]any{"estado": est, "uso": u, "filaPausada": now.Before(paused), "versao": Version}, nil
 }

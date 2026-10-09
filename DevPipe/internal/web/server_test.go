@@ -131,3 +131,17 @@ func TestProjectAndDemandFlow(t *testing.T) {
 }
 
 func itoa(i int64) string { b, _ := json.Marshal(i); return string(b) }
+
+func TestFazendaEndpoint(t *testing.T) {
+	h, _ := newTestServer(t)
+	w := do(h, "GET", "/api/fazenda", nil, nil)
+	if w.Code != 200 || !bytes.Contains(w.Body.Bytes(), []byte(`"clima":"sol"`)) || !bytes.Contains(w.Body.Bytes(), []byte(`"demandas":[]`)) {
+		t.Fatalf("fazenda: %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "GET", "/fazenda.html", nil, nil); w.Code != 200 || !bytes.Contains(w.Body.Bytes(), []byte("phaser.min.js")) {
+		t.Fatal("página da fazenda não servida")
+	}
+	if w := do(h, "GET", "/vendor/phaser.min.js", nil, nil); w.Code != 200 || w.Body.Len() < 500000 {
+		t.Fatal("Phaser não embutido")
+	}
+}

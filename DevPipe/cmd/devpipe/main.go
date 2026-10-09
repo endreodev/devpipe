@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"devpipe/internal/encx"
 	"devpipe/internal/gitx"
 	"devpipe/internal/pipeline"
 	"devpipe/internal/provider"
@@ -36,6 +37,10 @@ func defaultDataDir() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "hook-encoding" {
+		hookEncoding(os.Args[2:])
+		return
+	}
 	port := flag.Int("port", 7420, "porta HTTP local")
 	dataDir := flag.String("data", defaultDataDir(), "pasta de dados (banco, anexos, worktrees)")
 	noOpen := flag.Bool("no-browser", false, "não abrir o navegador automaticamente")
@@ -151,4 +156,29 @@ func openBrowser(url string) {
 		cmd = exec.Command("xdg-open", url)
 	}
 	_ = cmd.Start()
+}
+
+// hookEncoding é executado pelo Claude Code (hook PreToolUse) antes de cada
+// leitura/edição: converte para UTF-8 apenas o arquivo que o agente vai usar.
+// Nunca bloqueia o agente: em caso de erro, a reparação posterior continua valendo.
+func hookEncoding(args []string) {
+	fs := flag.NewFlagSet("hook-encoding", flag.ContinueOnError)
+	root := fs.String("root", "", "")
+	manifest := fs.String("manifest", "", "")
+	if fs.Parse(args) != nil || *root == "" || *manifest == "" {
+		return
+	}
+	var in struct {
+		ToolInput map[string]any `json:"tool_input"`
+	}
+	if json.NewDecoder(io.LimitReader(os.Stdin, 4<<20)).Decode(&in) != nil {
+		return
+	}
+	for _, k := range []string{"file_path", "notebook_path"} {
+		if p, ok := in.ToolInput[k].(string); ok && p != "" {
+			if err := encx.HookConvert(*root, *manifest, p); err != nil {
+				fmt.Fprintln(os.Stderr, "devpipe hook-encoding:", err)
+			}
+		}
+	}
 }

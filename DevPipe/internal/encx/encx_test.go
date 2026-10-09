@@ -184,3 +184,43 @@ func TestAnyTextExtensionIsProtected(t *testing.T) {
 		t.Fatalf("restauração deveria deixar tudo idêntico: %v %q", rep.Issues, git(t, dir, "status", "--porcelain"))
 	}
 }
+
+func TestHookModeConvertsOnlyTouchedFiles(t *testing.T) {
+	dir := setupRepo(t)
+	base := gitBase(t, dir)
+	man := filepath.Join(t.TempDir(), "m.txt")
+	// o agente abre só Permissao.cs
+	if err := HookConvert(dir, man, filepath.Join(dir, "Permissao.cs")); err != nil {
+		t.Fatal(err)
+	}
+	HookConvert(dir, man, filepath.Join(dir, "Permissao.cs")) // reabrir não duplica
+	HookConvert(dir, man, "/fora/da/worktree.cs")             // ignorado
+	u, _ := os.ReadFile(filepath.Join(dir, "Util.cs"))
+	if Detect(u) != CP1252 {
+		t.Fatal("arquivo não aberto pelo agente não deveria ser convertido")
+	}
+	simulateAgentEdit(t, filepath.Join(dir, "Permissao.cs"), "// ação padrão: negar", "// ação padrão: negar sempre")
+	m := LoadManifest(man)
+	if len(m.Converted) != 1 {
+		t.Fatalf("manifesto: %+v", m.Converted)
+	}
+	rep := Restore(dir, base, m, Auto)
+	got, _ := os.ReadFile(filepath.Join(dir, "Permissao.cs"))
+	want := cp(t, strings.Replace(original, "// ação padrão: negar", "// ação padrão: negar sempre", 1))
+	if !bytes.Equal(got, want) || len(rep.Issues) > 0 {
+		t.Fatalf("%v\n%q", rep.Issues, got)
+	}
+	if st := git(t, dir, "status", "--porcelain"); st != "M Permissao.cs" {
+		t.Fatalf("só o arquivo editado deveria aparecer: %q", st)
+	}
+}
+
+func TestReadOnlyConvertedFileRestoredByteExact(t *testing.T) {
+	dir := setupRepo(t)
+	man := filepath.Join(t.TempDir(), "m.txt")
+	HookConvert(dir, man, "Util.cs") // caminho relativo também é aceito
+	Restore(dir, gitBase(t, dir), LoadManifest(man), Auto)
+	if st := git(t, dir, "status", "--porcelain"); st != "" {
+		t.Fatalf("arquivo apenas lido deveria voltar idêntico: %q", st)
+	}
+}

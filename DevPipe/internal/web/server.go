@@ -34,7 +34,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.1.3"
+const Version = "0.1.4"
 
 type Server struct {
 	st      *store.Store
@@ -55,7 +55,8 @@ func ConfigureProviders(reg *provider.Registry, s domain.Settings) {
 	reg.Remove("generico")
 	if s.Claude.Enabled {
 		reg.Register(&provider.Claude{Binary: s.Claude.Binary, DefaultModel: s.Claude.Model, PermissionMode: s.Claude.PermissionMode,
-			MaxBudgetUSD: s.Claude.MaxBudgetUSD, ExtraArgs: strings.Fields(s.Claude.ExtraArgs), SubscriptionOnly: s.Claude.SubscriptionOnly})
+			MaxBudgetUSD: s.Claude.MaxBudgetUSD, ExtraArgs: strings.Fields(s.Claude.ExtraArgs), SubscriptionOnly: s.Claude.SubscriptionOnly,
+			AnalysisModel: s.Claude.AnalysisModel, Effort: s.Claude.Effort})
 	}
 	if s.Generic.Enabled && strings.TrimSpace(s.Generic.Command) != "" {
 		reg.Register(&provider.Generic{DisplayName: s.Generic.Name, Command: s.Generic.Command})
@@ -804,6 +805,11 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) (any, erro
 	}
 	if st.MaxParallel < 1 {
 		st.MaxParallel = 1
+	}
+	switch st.Claude.Effort {
+	case "", "low", "medium", "high", "xhigh", "max":
+	default:
+		return nil, errors.New("nível de esforço inválido")
 	}
 	if st.Claude.PermissionMode == "bypassPermissions" {
 		return nil, errors.New("o modo bypassPermissions não é permitido na esteira")

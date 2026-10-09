@@ -275,6 +275,7 @@ type runState struct {
 	started   time.Time
 	baseSecs  int64
 	encIssues []encx.Issue // problemas de codificação pendentes (viram falha de validação)
+	encSeq    int
 }
 
 func (e *Engine) setStage(rs *runState, s domain.Stage, status, msg string) {
@@ -412,16 +413,35 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	attDirs := []string{filepath.Join(e.dataDir, "anexos", fmt.Sprint(d.ID))}
 
 	// --- ANÁLISE + PLANEJAMENTO
+	analysisSession := ""
+	pendingEnc := "" // manifesto da análise mantido para o desenvolvimento (evita reconverter)
+	defer func() {
+		if pendingEnc != "" { // saída antecipada: nunca deixar arquivos convertidos
+			e.encRestore(rs, p, wt, nil, pendingEnc)
+		}
+	}()
 	if strings.TrimSpace(rev.Spec) == "" {
 		e.setStage(rs, domain.StageAnalysis, domain.StatusRunning, "IA interpretando requisitos, anexos e o projeto")
-		workdir := p.Path
-		if wtExists {
-			workdir = wt
+		// a análise já roda na branch isolada: vê exatamente o código que será
+		// alterado (sem as alterações locais do usuário) e permite que o
+		// desenvolvimento continue a mesma sessão, sem reler o projeto.
+		if err := e.prepareGit(rs, p, wt); err != nil {
+			fail(domain.StagePrep, err)
+			return
 		}
+		pc.D = d
+		aman, apath := e.encPrepare(rs, wt, prov)
 		actx, cancel := context.WithTimeout(ctx, agentTimeout)
-		res, err := prov.Run(actx, provider.Request{Phase: provider.PhaseAnalysis, WorkDir: workdir, SystemPrompt: security.SecurityPreamble,
-			Prompt: analysisPrompt(pc), ExtraReadDirs: attDirs, Model: d.Model}, e.agentEmitter(rs))
+		res, err := prov.Run(actx, provider.Request{Phase: provider.PhaseAnalysis, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
+			Prompt: analysisPrompt(pc), ExtraReadDirs: attDirs, Model: d.Model, EncodingManifest: apath}, e.agentEmitter(rs))
 		cancel()
+		if err != nil || d.ReviewSpec || apath == "" {
+			e.encRestore(rs, p, wt, aman, apath)
+			rs.encIssues = nil // análise é somente leitura
+		} else {
+			pendingEnc = apath // o desenvolvimento continua com os mesmos arquivos já convertidos
+		}
+		analysisSession = res.SessionID
 		run.CostUSD += res.CostUSD
 		if err != nil {
 			fail(domain.StageAnalysis, fmt.Errorf("análise falhou: %w", err))
@@ -455,9 +475,11 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 
 	// --- PREPARAÇÃO (Git)
 	e.setStage(rs, domain.StagePrep, domain.StatusRunning, "Validando repositório e preparando branch isolada")
-	if err := e.prepareGit(rs, p, wt); err != nil {
-		fail(domain.StagePrep, err)
-		return
+	if analysisSession == "" || !dirExists(wt) { // na análise a branch já foi preparada
+		if err := e.prepareGit(rs, p, wt); err != nil {
+			fail(domain.StagePrep, err)
+			return
+		}
 	}
 	repo := gitx.Repo{Dir: wt}
 	pc.D = d
@@ -482,16 +504,40 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	if skipDev {
 		e.log(d, run.ID, domain.LevelInfo, "retomada", "Retomando pela validação: a implementação desta revisão já existe na worktree", "")
 		devSummary = e.lastSummary(d.ID)
-		e.encRestore(rs, p, wt, nil) // repara branches afetadas por versões anteriores
+		if pendingEnc != "" {
+			e.encRestore(rs, p, wt, nil, pendingEnc)
+			pendingEnc = ""
+		}
+		e.encRestore(rs, p, wt, nil, "") // repara branches afetadas por versões anteriores
 	} else {
 		e.setStage(rs, domain.StageDev, domain.StatusRunning, "IA implementando as alterações")
-		man := e.encPrepare(rs, wt)
-		pc.EncodingNote = encodingNote(man)
+		man, mpath := e.encPrepare(rs, wt, prov)
+		if pendingEnc != "" && mpath != "" {
+			mpath, pendingEnc = pendingEnc, ""
+		}
+		pc.EncodingNote = encodingNote(man, mpath != "")
+		if analysisSession != "" {
+			e.log(d, run.ID, domain.LevelInfo, "sessao", "Desenvolvimento continua a sessão da análise (o agente já conhece os arquivos analisados)", "")
+		}
 		dctx, cancel := context.WithTimeout(ctx, agentTimeout)
 		res, err := prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
-			Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model}, e.agentEmitter(rs))
+			Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
+			ResumeSession: analysisSession, EncodingManifest: mpath}, e.agentEmitter(rs))
 		cancel()
-		e.encRestore(rs, p, wt, man) // sempre, mesmo se o agente falhar
+		if err != nil && analysisSession != "" && res.SessionID == "" && ctx.Err() == nil {
+			var lim *provider.ErrPlanLimit
+			var pol *provider.ErrPolicy
+			if !errors.As(err, &lim) && !errors.As(err, &pol) {
+				// sessão anterior indisponível: nova sessão do zero
+				e.log(d, run.ID, domain.LevelWarn, "sessao", "Não foi possível continuar a sessão da análise; iniciando nova sessão", err.Error())
+				dctx, cancel = context.WithTimeout(ctx, agentTimeout)
+				res, err = prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
+					Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
+					EncodingManifest: mpath}, e.agentEmitter(rs))
+				cancel()
+			}
+		}
+		e.encRestore(rs, p, wt, man, mpath) // sempre, mesmo se o agente falhar
 		run.CostUSD += res.CostUSD
 		run.SessionID = res.SessionID
 		e.st.UpdateRun(*run)
@@ -519,14 +565,14 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		d.StatusMessage = fmt.Sprintf("Corrigindo falhas de validação (tentativa %d)", attempt)
 		e.touch(&d, d.StatusMessage)
 		e.save(&d)
-		fman := e.encPrepare(rs, wt)
-		pc.EncodingNote = encodingNote(fman)
+		fman, fpath := e.encPrepare(rs, wt, prov)
+		pc.EncodingNote = encodingNote(fman, fpath != "")
 		fctx, cancel := context.WithTimeout(ctx, agentTimeout)
 		res, err := prov.Run(fctx, provider.Request{Phase: provider.PhaseFix, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
 			Prompt: fixPrompt(pc, rev.Spec, output, attempt), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
-			ResumeSession: run.SessionID}, e.agentEmitter(rs))
+			ResumeSession: run.SessionID, EncodingManifest: fpath}, e.agentEmitter(rs))
 		cancel()
-		e.encRestore(rs, p, wt, fman)
+		e.encRestore(rs, p, wt, fman, fpath)
 		run.CostUSD += res.CostUSD
 		if res.SessionID != "" {
 			run.SessionID = res.SessionID
@@ -602,30 +648,46 @@ func (e *Engine) waitPlanLimit(d *domain.Demand, run *domain.Run, stage domain.S
 	e.log(*d, runID(run), domain.LevelWarn, "limite_plano", d.StatusMessage, "")
 }
 
-// encPrepare converte temporariamente arquivos Windows-1252 para UTF-8, para que
-// as ferramentas de edição do agente não corrompam a acentuação.
-func (e *Engine) encPrepare(rs *runState, wt string) *encx.Manifest {
+// encPrepare protege a codificação durante a edição do agente.
+// Com provedores que suportam hooks (Claude), a conversão é sob demanda: só os
+// arquivos que o agente abrir são convertidos (milissegundos). Para os demais,
+// converte os arquivos Windows-1252 da worktree antes da execução.
+func (e *Engine) encPrepare(rs *runState, wt string, prov provider.Provider) (*encx.Manifest, string) {
+	if hc, ok := prov.(provider.HookCapable); ok && hc.SupportsEncodingHook() {
+		dir := filepath.Join(e.dataDir, "codificacao")
+		os.MkdirAll(dir, 0o755)
+		rs.encSeq++
+		path := filepath.Join(dir, fmt.Sprintf("run%d-%d.txt", rs.run.ID, rs.encSeq))
+		os.Remove(path)
+		return nil, path
+	}
+	start := time.Now()
 	m, err := encx.Prepare(wt)
 	if err != nil {
 		e.log(*rs.d, rs.run.ID, domain.LevelWarn, "codificacao", "Não foi possível preparar a codificação dos arquivos", err.Error())
 	}
 	if m != nil && len(m.Converted) > 0 {
 		e.log(*rs.d, rs.run.ID, domain.LevelInfo, "codificacao",
-			fmt.Sprintf("Codificação protegida: %d arquivo(s) Windows-1252 convertidos temporariamente para UTF-8 durante a edição da IA", len(m.Converted)), "")
-	} else if m != nil {
-		e.log(*rs.d, rs.run.ID, domain.LevelInfo, "codificacao",
-			fmt.Sprintf("Codificação verificada: nenhum arquivo ANSI/Windows-1252 encontrado (%d arquivo(s) UTF-8 com acentos)", m.UTF8), "")
+			fmt.Sprintf("Codificação protegida: %d arquivo(s) Windows-1252 convertidos temporariamente para UTF-8 (%s)", len(m.Converted), time.Since(start).Round(time.Second)), "")
 	}
-	return m
+	return m, ""
 }
 
 // encRestore devolve os arquivos à codificação original e repara '�'.
-func (e *Engine) encRestore(rs *runState, p domain.Project, wt string, m *encx.Manifest) {
+func (e *Engine) encRestore(rs *runState, p domain.Project, wt string, m *encx.Manifest, manifestPath string) {
+	start := time.Now()
+	if manifestPath != "" {
+		m = encx.LoadManifest(manifestPath)
+		defer func() {
+			os.Remove(manifestPath)
+			os.Remove(manifestPath + ".settings.json")
+		}()
+	}
 	repo := gitx.Repo{Dir: wt}
 	rep := encx.Restore(wt, repo.MergeBase(rs.d.BaseBranch), m, p.FileEncoding)
 	rs.encIssues = rep.Issues
 	if m != nil && len(m.Converted) > 0 {
-		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", "Arquivos devolvidos à codificação original (Windows-1252, finais de linha preservados)", "")
+		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", fmt.Sprintf("Codificação protegida: %d arquivo(s) Windows-1252 usados pela IA foram devolvidos à codificação original (%s)", len(m.Converted), time.Since(start).Round(100*time.Millisecond)), strings.Join(keys(m.Converted), "\n"))
 	}
 	if len(rep.Restored) > 0 {
 		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", fmt.Sprintf("%d arquivo(s) regravados na codificação original do projeto", len(rep.Restored)), strings.Join(rep.Restored, "\n"))
@@ -642,13 +704,21 @@ func (e *Engine) encRestore(rs *runState, p domain.Project, wt string, m *encx.M
 	}
 }
 
-func encodingNote(m *encx.Manifest) string {
-	if m == nil || (len(m.Converted) == 0 && m.Predominant != encx.CP1252) {
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func encodingNote(m *encx.Manifest, onDemand bool) string {
+	if !onDemand && (m == nil || len(m.Converted) == 0) {
 		return ""
 	}
-	return "Os arquivos deste projeto usam a codificação Windows-1252 (ANSI). A aplicação os converteu temporariamente para UTF-8 para que você os leia e edite corretamente, e os devolverá automaticamente à codificação original ao final. " +
+	return "Se algum arquivo deste projeto estiver em Windows-1252 (ANSI), a aplicação o converte automaticamente para UTF-8 quando você o abre e o devolve à codificação original ao final. " +
 		"Escreva normalmente com acentuação em português. Não converta codificação, não altere finais de linha e não reescreva arquivos inteiros. " +
-		"Use somente caracteres que existem em Windows-1252: evite setas (→), emojis, símbolos matemáticos especiais e caracteres de outros alfabetos."
+		"Use somente caracteres que existem em Windows-1252: evite setas (→), emojis e símbolos especiais."
 }
 
 // RepairEncoding executa somente o reparo de codificação na worktree da

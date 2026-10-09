@@ -210,6 +210,8 @@ type ClaudeSettings struct {
 	ExtraArgs      string `json:"extraArgs"` // argumentos extras para a CLI (avançado)
 	// SubscriptionOnly: usar apenas o limite da assinatura Pro/Max (padrão: sim).
 	SubscriptionOnly bool    `json:"subscriptionOnly"`
+	AnalysisModel    string  `json:"analysisModel"` // modelo da análise (vazio = padrão)
+	Effort           string  `json:"effort"`        // low|medium|high|xhigh|max (vazio = padrão da CLI)
 	MaxBudgetUSD     float64 `json:"maxBudgetUsd"`
 }
 

@@ -1,6 +1,9 @@
 package provider
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -63,5 +66,39 @@ func TestSystemPromptSingleLineAndLauncher(t *testing.T) {
 	exe, args := resolveLauncher("/usr/bin/claude", []string{"-p"})
 	if exe != "/usr/bin/claude" || len(args) != 1 {
 		t.Fatal("binário nativo não deve ser alterado")
+	}
+}
+
+func TestHookSettingsUseExecFormAndEffort(t *testing.T) {
+	dir := t.TempDir()
+	c := &Claude{HookExe: `C:\Program Files\DevPipe\devpipe.exe`, Effort: "low", AnalysisModel: "sonnet", DefaultModel: "opus"}
+	man := filepath.Join(dir, "m.txt")
+	a := c.BuildArgs(Request{Phase: PhaseAnalysis, WorkDir: dir, EncodingManifest: man})
+	if argValue(a, "--effort") != "low" || argValue(a, "--model") != "sonnet" {
+		t.Fatalf("args: %v", a)
+	}
+	if m := argValue(c.BuildArgs(Request{Phase: PhaseDevelop, WorkDir: dir}), "--model"); m != "opus" {
+		t.Fatalf("desenvolvimento deve usar o modelo padrão: %s", m)
+	}
+	b, err := os.ReadFile(argValue(a, "--settings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Hooks struct {
+			PreToolUse []struct {
+				Matcher string
+				Hooks   []struct {
+					Command string
+					Args    []string
+				}
+			}
+		}
+	}
+	json.Unmarshal(b, &cfg)
+	h := cfg.Hooks.PreToolUse[0]
+	if !strings.Contains(h.Matcher, "Read") || !strings.Contains(h.Matcher, "Edit") || h.Hooks[0].Command != c.HookExe ||
+		h.Hooks[0].Args[0] != "hook-encoding" || h.Hooks[0].Args[4] != man {
+		t.Fatalf("hook: %s", b)
 	}
 }

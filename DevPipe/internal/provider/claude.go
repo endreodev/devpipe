@@ -31,6 +31,36 @@ type Claude struct {
 	// ambiente as variáveis de chave de API, aborta se a CLI reportar outra
 	// fonte de autenticação e aborta se o "uso extra" pago for acionado.
 	SubscriptionOnly bool
+	AnalysisModel    string // modelo para a etapa de análise (vazio = DefaultModel)
+	Effort           string // low | medium | high | xhigh | max (vazio = padrão da CLI)
+	// HookExe: executável chamado pelo hook de codificação (padrão: o próprio DevPipe).
+	HookExe string
+}
+
+func (c *Claude) SupportsEncodingHook() bool { return true }
+
+// hookSettings grava o arquivo de configurações com o hook PreToolUse que
+// converte a codificação sob demanda. Usa a forma "args" (sem shell), que
+// evita problemas de aspas no Windows.
+func (c *Claude) hookSettings(req Request) (string, error) {
+	exe := c.HookExe
+	if exe == "" {
+		e, err := os.Executable()
+		if err != nil {
+			return "", err
+		}
+		exe = e
+	}
+	cfg := map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
+		"matcher": "Read|Edit|MultiEdit|Write|NotebookEdit",
+		"hooks": []any{map[string]any{
+			"type": "command", "command": exe, "timeout": 60,
+			"args": []string{"hook-encoding", "--root", req.WorkDir, "--manifest", req.EncodingManifest},
+		}},
+	}}}}
+	b, _ := json.Marshal(cfg)
+	path := req.EncodingManifest + ".settings.json"
+	return path, os.WriteFile(path, b, 0o600)
 }
 
 // apiEnvVars direcionariam a CLI para cobrança fora da assinatura.
@@ -135,6 +165,9 @@ func (c *Claude) BuildArgs(req Request) []string {
 		args = append(args, "--append-system-prompt", strings.Join(strings.Fields(req.SystemPrompt), " "))
 	}
 	model := req.Model
+	if model == "" && req.Phase == PhaseAnalysis {
+		model = c.AnalysisModel
+	}
 	if model == "" {
 		model = c.DefaultModel
 	}
@@ -146,6 +179,14 @@ func (c *Claude) BuildArgs(req Request) []string {
 	}
 	if req.ResumeSession != "" {
 		args = append(args, "--resume", req.ResumeSession)
+	}
+	if c.Effort != "" {
+		args = append(args, "--effort", c.Effort)
+	}
+	if req.EncodingManifest != "" {
+		if path, err := c.hookSettings(req); err == nil {
+			args = append(args, "--settings", path)
+		}
 	}
 	if c.MaxBudgetUSD > 0 {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", c.MaxBudgetUSD))

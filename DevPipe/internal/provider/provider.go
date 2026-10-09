@@ -58,7 +58,14 @@ type Request struct {
 	BashAllow     []string // padrões de Bash liberados (validação do projeto)
 	Model         string
 	ResumeSession string // continuar sessão anterior (correções)
+	// EncodingManifest: se preenchido, o provedor deve converter para UTF-8 cada
+	// arquivo imediatamente antes de o agente lê-lo/editá-lo (hook), registrando
+	// neste arquivo. Vazio = conversão feita antes da execução (modo completo).
+	EncodingManifest string
 }
+
+// HookCapable: provedores que convertem a codificação sob demanda (hooks).
+type HookCapable interface{ SupportsEncodingHook() bool }
 
 // Event é um evento observado durante a execução do agente.
 type Event struct {

@@ -138,12 +138,19 @@ Problema observado em produção: em projetos Windows-1252, a ferramenta de edi�
 
 | Etapa | O que acontece |
 |---|---|
-| `Prepare` (antes de cada chamada de desenvolvimento/correção) | Varre os arquivos versionados de texto da worktree; os que não são UTF-8 válido são decodificados como Windows-1252 (tabela própria, ida e volta sem perdas inclusive para os 5 bytes indefinidos) e gravados em UTF-8. Registra a codificação original e a predominante do repositório. |
+| **Modo sob demanda (Claude, padrão)** | O DevPipe registra um hook `PreToolUse` (forma `args`, sem shell) para `Read/Edit/MultiEdit/Write`: imediatamente antes de o agente abrir um arquivo, `devpipe.exe hook-encoding` converte só esse arquivo e o anota num manifesto. Em um repositório com 1.415 arquivos ANSI, a proteção caiu de ~4 min para menos de 1 s. |
+| `Prepare` completo (provedores sem hooks) | Varre os arquivos versionados de texto da worktree; os que não são UTF-8 válido são decodificados como Windows-1252 (tabela própria, ida e volta sem perdas inclusive para os 5 bytes indefinidos) e gravados em UTF-8. Registra a codificação original e a predominante do repositório. |
 | Agente edita | Vê a acentuação correta. O prompt informa que a reconversão é automática e pede somente caracteres representáveis em Windows-1252. |
 | `Restore` (sempre, mesmo se o agente falhar) | Para cada arquivo alterado (worktree e commits desde o merge-base): codificação alvo = original registrada › codificação na branch base › padrão do projeto. Preserva BOM e CRLF (quando a base era 100% CRLF). Recupera U+FFFD por correspondência com o vocabulário da versão base (uma sequência de U+FFFD casa 1+ caracteres não-ASCII; só corrige quando há candidata única). |
 | Validação | Problemas restantes (U+FFFD sem candidata, caracteres fora de Windows-1252) reprovam a validação e entram no ciclo de correção da IA. |
 
 O diff exibido na interface decodifica linhas Windows-1252 para exibição. A ação "Reparar acentuação" executa apenas o `Restore` em uma worktree existente (branches afetadas por versões anteriores) e faz commit local.
+
+## 6.2 Desempenho
+
+- A branch isolada é criada **antes** da análise; a análise roda nela e o desenvolvimento **continua a mesma sessão** do agente (`--resume`), sem reler o projeto.
+- O prompt de análise limita a exploração aos arquivos necessários e pede especificação concisa.
+- Opções em *Provedores de IA*: modelo específico para a análise (ex.: um modelo mais rápido) e nível de esforço (`--effort`).
 
 ## 7. Pontos de extensão
 

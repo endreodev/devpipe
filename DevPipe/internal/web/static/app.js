@@ -751,6 +751,10 @@ VIEWS.provedores = async () => {
       <label class="check"><input type="checkbox" name="cSubOnly" ${c.subscriptionOnly ? "checked" : ""}><span><b>Usar somente o limite da assinatura Pro/Max</b><br><span class="help">Ignora chaves de API do ambiente (ANTHROPIC_API_KEY etc.), interrompe a execução se a CLI estiver autenticada por chave de API ou se o "uso extra" pago for acionado, e pausa a fila quando o limite do plano acabar.</span></span></label>
       <label class="f"><span>Executável</span><input type="text" name="cBinary" class="mono" value="${esc(c.binary)}"><div class="help">Caminho completo se não estiver no PATH (ex.: C:\\Users\\voce\\.local\\bin\\claude.exe).</div></label>
       <label class="f"><span>Modelo padrão</span><input type="text" name="cModel" value="${esc(c.model)}" placeholder="padrão da CLI (ex.: sonnet, opus)"></label>
+      <div class="grid g2" style="gap:10px">
+        <label class="f"><span>Modelo da análise (opcional)</span><input type="text" name="cAModel" value="${esc(c.analysisModel || "")}" placeholder="ex.: sonnet (mais rápido)"><div class="help">A especificação pode usar um modelo mais rápido que o desenvolvimento.</div></label>
+        <label class="f"><span>Nível de esforço</span><select name="cEffort">${[["", "Padrão da CLI"], ["low", "Baixo — mais rápido"], ["medium", "Médio"], ["high", "Alto"], ["xhigh", "Muito alto"], ["max", "Máximo — mais lento"]].map(([v, l]) => `<option value="${v}" ${(c.effort || "") === v ? "selected" : ""}>${l}</option>`).join("")}</select><div class="help">Menos esforço = respostas mais rápidas e menor consumo do plano.</div></label>
+      </div>
       <label class="f"><span>Modo de permissão no desenvolvimento</span><select name="cPerm">${["acceptEdits", "dontAsk", "default"].map((m) => `<option ${c.permissionMode === m ? "selected" : ""}>${m}</option>`).join("")}</select><div class="help">acceptEdits: aceita edições de arquivo; demais ações seguem a lista liberada. bypassPermissions nunca é usado.</div></label>
       <label class="f"><span>Orçamento máximo por chamada (US$, opcional — só se aplica a chave de API)</span><input type="number" step="0.5" name="cBudget" value="${c.maxBudgetUsd || ""}"></label>
       <label class="f"><span>Argumentos extras (avançado)</span><input type="text" name="cExtra" class="mono" value="${esc(c.extraArgs)}"></label>
@@ -771,7 +775,7 @@ VIEWS.provedores = async () => {
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const st = { ...S.settings, defaultProvider: f.defProv.value,
-      claude: { enabled: f.cEnabled.checked, binary: f.cBinary.value.trim() || "claude", model: f.cModel.value.trim(), permissionMode: f.cPerm.value, maxBudgetUsd: +f.cBudget.value || 0, extraArgs: f.cExtra.value.trim(), subscriptionOnly: f.cSubOnly.checked },
+      claude: { enabled: f.cEnabled.checked, binary: f.cBinary.value.trim() || "claude", model: f.cModel.value.trim(), permissionMode: f.cPerm.value, maxBudgetUsd: +f.cBudget.value || 0, extraArgs: f.cExtra.value.trim(), subscriptionOnly: f.cSubOnly.checked, analysisModel: f.cAModel.value.trim(), effort: f.cEffort.value },
       generic: { enabled: f.gEnabled.checked, name: f.gName.value, command: f.gCmd.value } };
     S.settings = await guarded(() => api("PUT", "/api/settings", st), "Provedores salvos"); render();
   });

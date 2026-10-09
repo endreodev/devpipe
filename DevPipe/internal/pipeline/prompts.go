@@ -91,7 +91,8 @@ func analysisPrompt(c promptCtx) string {
 	var b strings.Builder
 	b.WriteString(header(c))
 	b.WriteString("\n## SUA TAREFA NESTA ETAPA: ANÁLISE E PLANEJAMENTO (somente leitura)\n")
-	b.WriteString("Você NÃO deve alterar arquivos agora. Leia a solicitação, os anexos e explore o repositório (estrutura, tecnologias, convenções, arquivos relacionados) para produzir uma especificação normalizada e um plano.\n")
+	b.WriteString("Você NÃO deve alterar arquivos agora. Leia a solicitação e os anexos e examine SOMENTE os arquivos do repositório necessários para entender o que mudar (use Grep/Glob para localizar; leia apenas os trechos relevantes). Seja rápido e objetivo: não faça varreduras amplas, não investigue histórico Git nem alterações locais, e não verifique codificação de caracteres (a aplicação cuida disso).\n")
+	b.WriteString("O diretório atual é a branch de trabalho desta demanda; os arquivos que você ler aqui serão os editados no desenvolvimento, que continuará esta mesma sessão.\n")
 	b.WriteString("Não invente regras de negócio ausentes: quando algo não estiver claro, registre em 'Pontos que precisam de esclarecimento' ou 'Pressupostos'.\n\n")
 
 	if c.Rev.Number > 1 {
@@ -121,7 +122,7 @@ func analysisPrompt(c promptCtx) string {
 	b.WriteString("\n## REGRAS E PADRÕES QUE A IMPLEMENTAÇÃO DEVERÁ SEGUIR\n" + c.Rules + "\n")
 	b.WriteString(`
 ## FORMATO DA RESPOSTA FINAL
-Responda APENAS com um documento Markdown, em português, com exatamente estas seções (use "Não se aplica" quando for o caso):
+Responda APENAS com um documento Markdown, em português, CONCISO (frases curtas e listas; sem repetir código; idealmente até 80 linhas), com exatamente estas seções (use "Não se aplica" quando for o caso):
 
 # Especificação — <ticket>
 ## Objetivo

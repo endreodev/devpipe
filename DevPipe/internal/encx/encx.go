@@ -16,6 +16,8 @@ package encx
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -160,14 +162,43 @@ func looksBinary(b []byte) bool {
 // Manifest registra a codificação original dos arquivos convertidos.
 type Manifest struct {
 	Converted   map[string]string // caminho relativo -> codificação original
-	Predominant string            // codificação predominante do repositório (utf-8 ou windows-1252)
+	Hash        map[string]string // caminho relativo -> sha256 do UTF-8 gravado na conversão
+	Predominant string            // codificação predominante (vazio = calcular se necessário)
 	Legacy      int
 	UTF8        int
 }
 
-// Prepare converte para UTF-8 os arquivos versionados em Windows-1252.
+func newManifest() *Manifest {
+	return &Manifest{Converted: map[string]string{}, Hash: map[string]string{}}
+}
+
+func sha(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// ConvertFile converte um único arquivo Windows-1252 para UTF-8 (sem perdas).
+// Devolve converted=false se o arquivo não precisa de conversão.
+func ConvertFile(full string) (converted bool, hash string, err error) {
+	b, err := os.ReadFile(full)
+	if err != nil || len(b) > 20<<20 || looksBinary(b) || Detect(b) != CP1252 {
+		return false, "", nil
+	}
+	st, err := os.Stat(full)
+	if err != nil {
+		return false, "", err
+	}
+	out := []byte(DecodeCP1252(b))
+	if err := os.WriteFile(full, out, st.Mode().Perm()); err != nil {
+		return false, "", err
+	}
+	return true, sha(out), nil
+}
+
+// Prepare converte TODOS os arquivos versionados em Windows-1252 (modo
+// completo, usado por provedores sem suporte a hooks).
 func Prepare(dir string) (*Manifest, error) {
-	m := &Manifest{Converted: map[string]string{}, Predominant: UTF8}
+	m := newManifest()
 	files, err := gitx.Repo{Dir: dir}.TrackedFiles()
 	if err != nil {
 		return m, err
@@ -184,19 +215,70 @@ func Prepare(dir string) (*Manifest, error) {
 		switch Detect(b) {
 		case CP1252:
 			m.Legacy++
-			st, _ := os.Stat(full)
-			if err := os.WriteFile(full, []byte(DecodeCP1252(b)), st.Mode().Perm()); err != nil {
+			ok, h, err := ConvertFile(full)
+			if err != nil {
 				return m, fmt.Errorf("falha ao converter %s: %w", rel, err)
 			}
-			m.Converted[rel] = CP1252
+			if ok {
+				m.Converted[rel], m.Hash[rel] = CP1252, h
+			}
 		case UTF8, UTF8BOM:
 			m.UTF8++
 		}
 	}
 	if m.Legacy > m.UTF8 {
 		m.Predominant = CP1252
+	} else {
+		m.Predominant = UTF8
 	}
 	return m, nil
+}
+
+// ---------------------------------------------------------------- modo sob demanda (hook)
+
+// HookConvert é chamado pelo hook PreToolUse do agente, imediatamente antes de
+// ler/editar um arquivo: converte só esse arquivo e registra no manifesto.
+func HookConvert(root, manifestPath, file string) error {
+	if file == "" {
+		return nil
+	}
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(root, file)
+	}
+	file = filepath.Clean(file)
+	rel, err := filepath.Rel(root, file)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || !IsTextPath(file) {
+		return nil // fora da worktree: não mexe
+	}
+	ok, h, err := ConvertFile(file)
+	if err != nil || !ok {
+		return err
+	}
+	f, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s\t%s\t%s\n", filepath.ToSlash(rel), CP1252, h)
+	return err
+}
+
+// LoadManifest lê o manifesto gravado pelos hooks.
+func LoadManifest(path string) *Manifest {
+	m := newManifest()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return m
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		p := strings.Split(strings.TrimRight(l, "\r"), "\t")
+		if len(p) == 3 {
+			if _, dup := m.Converted[p[0]]; !dup { // vale a primeira conversão
+				m.Converted[p[0]], m.Hash[p[0]] = p[1], p[2]
+			}
+		}
+	}
+	return m
 }
 
 // ---------------------------------------------------------------- Restore
@@ -227,13 +309,24 @@ func Restore(dir, baseRef string, m *Manifest, defaultEnc string) Report {
 	var rep Report
 	repo := gitx.Repo{Dir: dir}
 	if m == nil {
-		m = &Manifest{Converted: map[string]string{}, Predominant: UTF8}
+		m = newManifest()
 	}
-	if defaultEnc == "" || defaultEnc == Auto {
-		defaultEnc = m.Predominant
-		if m.Legacy == 0 && m.UTF8 == 0 { // sem manifest: inferir pelo repositório
-			defaultEnc = predominant(repo, baseRef)
+	if m.Hash == nil {
+		m.Hash = map[string]string{}
+	}
+	resolvedDefault := ""
+	defaultFor := func() string { // calculado só se houver arquivo novo
+		if resolvedDefault == "" {
+			switch {
+			case defaultEnc != "" && defaultEnc != Auto:
+				resolvedDefault = defaultEnc
+			case m.Predominant != "":
+				resolvedDefault = m.Predominant
+			default:
+				resolvedDefault = predominantOnDisk(dir)
+			}
 		}
+		return resolvedDefault
 	}
 	seen := map[string]bool{}
 	var paths []string
@@ -255,6 +348,16 @@ func Restore(dir, baseRef string, m *Manifest, defaultEnc string) Report {
 		if err != nil || looksBinary(cur) {
 			continue
 		}
+		// caminho rápido: convertido e não alterado pelo agente -> bytes originais
+		if h, ok := m.Hash[rel]; ok && h == sha(cur) && m.Converted[rel] == CP1252 {
+			if orig, bad := EncodeCP1252(string(cur)); len(bad) == 0 {
+				st, _ := os.Stat(full)
+				if err := os.WriteFile(full, orig, st.Mode().Perm()); err != nil {
+					rep.Issues = append(rep.Issues, Issue{rel, 0, "falha ao restaurar codificação: " + err.Error()})
+				}
+				continue
+			}
+		}
 		baseBytes, inBase := repo.ShowFile(baseRef, rel)
 		baseEnc := ""
 		if inBase {
@@ -266,7 +369,10 @@ func Restore(dir, baseRef string, m *Manifest, defaultEnc string) Report {
 			case CP1252, UTF8, UTF8BOM, UTF16:
 				target = baseEnc
 			default: // novo ou ASCII puro: segue o padrão do projeto
-				target = defaultEnc
+				if inBase && baseEnc == ASCII && !hasNonASCII(cur) {
+					continue // continua ASCII puro: nada a fazer
+				}
+				target = defaultFor()
 			}
 		}
 		if target == UTF16 || target == ASCII {
@@ -347,34 +453,52 @@ func Restore(dir, baseRef string, m *Manifest, defaultEnc string) Report {
 	return rep
 }
 
-func predominant(repo gitx.Repo, ref string) string {
-	files, err := repo.TrackedFiles()
-	if err != nil {
-		return UTF8
-	}
-	legacy, u := 0, 0
-	for i, rel := range files {
-		if i > 3000 {
-			break
+// predominantOnDisk amostra os arquivos de texto da pasta (sem subprocessos).
+func predominantOnDisk(dir string) string {
+	legacy, u, seen := 0, 0, 0
+	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if seen >= 400 {
+			return filepath.SkipAll
 		}
-		if !IsTextPath(rel) {
-			continue
+		if err != nil {
+			return nil
 		}
-		b, ok := repo.ShowFile(ref, rel)
-		if !ok {
-			continue
+		name := d.Name()
+		if d.IsDir() {
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "bin" || name == "obj" || name == "packages" {
+				return filepath.SkipDir
+			}
+			return nil
 		}
+		if !IsTextPath(name) {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || len(b) > 2<<20 || looksBinary(b) {
+			return nil
+		}
+		seen++
 		switch Detect(b) {
 		case CP1252:
 			legacy++
 		case UTF8, UTF8BOM:
 			u++
 		}
-	}
+		return nil
+	})
 	if legacy > u {
 		return CP1252
 	}
 	return UTF8
+}
+
+func hasNonASCII(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------- reparo

@@ -1,0 +1,10 @@
+{
+  "name": "loja-demo",
+  "version": "1.0.0",
+  "description": "Projeto de demonstração da esteira DevPipe",
+  "private": true,
+  "scripts": {
+    "build": "node --check src/pedido.js",
+    "test": "node --test"
+  }
+}

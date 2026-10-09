@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevPipe — Esteira de Desenvolvimento IA</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b1119'/%3E%3Cpath d='M6 22 L13 10 L19 18 L26 8' stroke='%2322d3ee' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" width="30" height="30" aria-hidden="true"><rect width="32" height="32" rx="6" fill="#0b1119" stroke="#1f3347"/><path d="M6 22 L13 10 L19 18 L26 8" stroke="#22d3ee" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div><b>DEVPIPE</b><small>esteira IA</small></div>
+    </div>
+    <nav id="nav">
+      <a href="#/" data-route="dashboard"><i>◈</i>Central</a>
+      <a href="#/esteira" data-route="esteira"><i>▤</i>Esteira</a>
+      <a href="#/demandas/nova" data-route="nova" class="cta"><i>＋</i>Nova demanda</a>
+      <a href="#/monitor" data-route="monitor"><i>◉</i>Monitor</a>
+      <div class="navsep">Cadastros</div>
+      <a href="#/projetos" data-route="projetos"><i>⬡</i>Projetos</a>
+      <a href="#/regras" data-route="regras"><i>§</i>Padrões e regras</a>
+      <div class="navsep">Sistema</div>
+      <a href="#/provedores" data-route="provedores"><i>◎</i>Provedores de IA</a>
+      <a href="#/config" data-route="config"><i>⚙</i>Configuração e segurança</a>
+    </nav>
+    <div class="side-foot">
+      <div id="ai-indicator" class="ai-ind idle"><span class="dot"></span><span class="lbl">IA ociosa</span></div>
+      <div id="conn" class="conn">conectando…</div>
+    </div>
+  </aside>
+  <main id="view" class="view" tabindex="-1"></main>
+</div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true"><div class="modal-box" id="modal-box"></div></div>
+<script src="app.js"></script>
+</body>
+</html>

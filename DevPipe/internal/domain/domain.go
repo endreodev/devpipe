@@ -66,6 +66,7 @@ type Project struct {
 	AgentBashAllow []string  `json:"agentBashAllow"` // prefixos de comando liberados ao agente (ex.: "dotnet build")
 	BranchPrefix   string    `json:"branchPrefix"`
 	AutoCommit     bool      `json:"autoCommit"`
+	FileEncoding   string    `json:"fileEncoding"` // auto | windows-1252 | utf-8 | utf-8-bom (arquivos novos)
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
@@ -202,12 +203,14 @@ type Settings struct {
 }
 
 type ClaudeSettings struct {
-	Enabled        bool    `json:"enabled"`
-	Binary         string  `json:"binary"`
-	Model          string  `json:"model"`
-	PermissionMode string  `json:"permissionMode"`
-	ExtraArgs      string  `json:"extraArgs"` // argumentos extras para a CLI (avançado)
-	MaxBudgetUSD   float64 `json:"maxBudgetUsd"`
+	Enabled        bool   `json:"enabled"`
+	Binary         string `json:"binary"`
+	Model          string `json:"model"`
+	PermissionMode string `json:"permissionMode"`
+	ExtraArgs      string `json:"extraArgs"` // argumentos extras para a CLI (avançado)
+	// SubscriptionOnly: usar apenas o limite da assinatura Pro/Max (padrão: sim).
+	SubscriptionOnly bool    `json:"subscriptionOnly"`
+	MaxBudgetUSD     float64 `json:"maxBudgetUsd"`
 }
 
 type GenericSettings struct {
@@ -220,7 +223,7 @@ func DefaultSettings() Settings {
 	return Settings{
 		MaxParallel: 1, DefaultProvider: "claude", MaxFixAttempts: 2,
 		CommandTimeoutMin: 15, AgentTimeoutMin: 45, AutoStartQueue: true,
-		Claude:  ClaudeSettings{Enabled: true, Binary: "claude", PermissionMode: "acceptEdits"},
+		Claude:  ClaudeSettings{Enabled: true, Binary: "claude", PermissionMode: "acceptEdits", SubscriptionOnly: true},
 		Generic: GenericSettings{Name: "CLI genérico"},
 	}
 }

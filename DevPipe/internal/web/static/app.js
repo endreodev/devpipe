@@ -127,6 +127,9 @@ function connectStream() {
       if (["dashboard", "esteira"].includes(r.name) || (r.name === "demanda" && +r.id === d.id)) scheduleRender();
     } else if (msg.type === "event") {
       onEvent(msg.data);
+    } else if (msg.type === "usage") {
+      S.usage = msg.data;
+      if (route().name === "dashboard") scheduleRender();
     } else if (msg.type === "reload") {
       reloadDemands().then(() => scheduleRender(() => route().name === "esteira"));
     }
@@ -218,9 +221,20 @@ function cardHTML(d, draggable) {
 
 function emptyState(title, text, action) { return `<div class="empty"><b>${esc(title)}</b>${esc(text)}${action ? `<div style="margin-top:12px">${action}</div>` : ""}</div>`; }
 
+function planPanel(info) {
+  const u = info.usage;
+  const mode = info.subscriptionOnly ? `<span class="badge v-ok">Somente assinatura Pro — sem cobrança extra</span>` : `<span class="badge v-nao_executada">Chave de API permitida</span>`;
+  if (!u) return `<div class="panel" style="margin-top:14px"><div class="row"><h2 style="margin:0">Limite do plano Claude</h2><span class="grow"></span>${mode}</div><div class="small muted" style="margin-top:8px">O consumo aparece aqui após a primeira chamada ao Claude (ou use "Testar conexão" em Provedores de IA).</div></div>`;
+  const bar = (label, pct, reset) => { const c = pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--amber)" : "var(--green)";
+    return `<div><div class="row small"><span class="muted">${label}</span><span class="grow"></span><b class="mono">${Math.round(pct)}%</b></div><div class="bar"><i style="width:${Math.min(100, pct)}%;background:${c}"></i></div><div class="small dim">renova ${esc(fmtDate(reset))}</div></div>`; };
+  return `<div class="panel" style="margin-top:14px"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Limite do plano Claude</h2><span class="grow"></span>${mode}</div>
+    <div class="grid g2">${bar("Janela de 5 horas", u.fiveHourPct, u.fiveHourResetsAt)}${bar("Semana", u.sevenDayPct, u.sevenDayResetsAt)}</div>
+    <div class="small dim" style="margin-top:6px">Atualizado ${ago(u.updatedAt)}. Ao atingir o limite, a fila pausa e retoma sozinha quando o plano libera.</div></div>`;
+}
+
 // ------------------------------------------------------------ 1. CENTRAL
 VIEWS.dashboard = async () => {
-  const [stats, events] = await Promise.all([api("GET", "/api/stats"), api("GET", "/api/events?limit=40")]);
+  const [stats, events, uinfo] = await Promise.all([api("GET", "/api/stats"), api("GET", "/api/events?limit=40"), api("GET", "/api/usage")]);
   const done = stats.byStage.concluido || 0, blocked = stats.byStage.bloqueado || 0;
   const finished = stats.runsOk + stats.runsFailed;
   const rate = finished ? Math.round((stats.runsOk / finished) * 100) : null;
@@ -230,6 +244,7 @@ VIEWS.dashboard = async () => {
   $("#view").innerHTML = `
   <div class="page-head"><div><h1><small>Central de operações</small>Painel de missões</h1><div class="sub">Visão geral da esteira, execuções da IA e eventos recentes.</div></div>
     <div class="row"><a class="btn primary" href="#/demandas/nova">＋ Nova demanda</a><a class="btn" href="#/esteira">▤ Abrir esteira</a></div></div>
+  ${uinfo.pausedUntil ? `<div class="callout warn"><div class="grow">⏸ <b>Fila pausada:</b> o limite da assinatura foi atingido. As demandas continuam automaticamente em ${esc(fmtDate(uinfo.pausedUntil))}, sem cobrança extra.</div><button class="btn sm" data-act="resume-queue">Retomar agora</button></div>` : ""}
   ${S.projects.length === 0 ? `<div class="callout info">ℹ Comece cadastrando um <a href="#/projetos">projeto</a> (repositório Git local) e depois crie sua primeira demanda.</div>` : ""}
   <div class="grid g4">
     <div class="panel hud tile c-cyan"><div class="k">Missões totais</div><div class="v">${stats.total}</div><div class="hint">${stats.projects} projeto(s)</div></div>
@@ -240,8 +255,9 @@ VIEWS.dashboard = async () => {
   <div class="panel" style="margin-top:14px"><h2>Distribuição por etapa</h2>
     <div class="stagebar">${S.meta.stages.map((s) => { const n = stats.byStage[s.id] || 0; return n ? `<i style="width:${(n / total) * 100}%;background:${STAGE_COLOR[s.id]}" title="${esc(s.label)}: ${n}"></i>` : ""; }).join("")}</div>
     <div class="legend">${S.meta.stages.map((s) => `<span style="--c:${STAGE_COLOR[s.id]}">${esc(s.label)} <b>${stats.byStage[s.id] || 0}</b></span>`).join("")}</div>
-    <div class="small dim" style="margin-top:8px">Progresso médio: ${stats.avgProgress}% · Custo acumulado informado pelos provedores: US$ ${stats.totalCost.toFixed(2)}</div>
+    <div class="small dim" style="margin-top:8px">Progresso médio: ${stats.avgProgress}% · ${uinfo.subscriptionOnly ? `Custo equivalente em API (informativo — <b>não cobrado</b> na assinatura): US$ ${stats.totalCost.toFixed(2)}` : `Custo informado pelos provedores: US$ ${stats.totalCost.toFixed(2)}`}</div>
   </div>
+  ${planPanel(uinfo)}
   <div class="grid g2" style="margin-top:14px">
     <div class="panel"><h2>Missões ativas<span class="count">${active.length}</span></h2>
       <div class="grid" style="gap:8px">${active.length ? active.map((d) => cardHTML(d)).join("") : emptyState("Nenhuma missão ativa", " Coloque uma demanda na fila pela esteira.")}</div></div>
@@ -502,7 +518,7 @@ VIEWS.demanda = async (r, soft) => {
     body = det.runs.length ? det.runs.map((x) => runHTML(x, false)).join("") : emptyState("Sem execuções", "");
   } else if (tab === "diff") {
     const df = await api("GET", `/api/demands/${d.id}/diff`);
-    body = df.diff === "" && df.message ? `<div class="callout info">${esc(df.message)}</div>` : `<div class="panel"><div class="callout info small">Branch <b class="mono">${esc(df.branch)}</b> comparada com <b class="mono">${esc(df.base)}</b>. Worktree: <span class="mono">${esc(df.worktree)}</span>. Merge e push são sempre manuais.</div><pre class="mono small muted">${esc(df.stat)}</pre>${renderDiff(df.diff)}</div>`;
+    body = df.diff === "" && df.message ? `<div class="callout info">${esc(df.message)}</div>` : `<div class="panel"><div class="callout info small">Branch <b class="mono">${esc(df.branch)}</b> comparada com <b class="mono">${esc(df.base)}</b>. Worktree: <span class="mono">${esc(df.worktree)}</span>. Merge e push são sempre manuais.</div><div class="row" style="margin-bottom:8px"><span class="grow"></span>${!["executando", "na_fila"].includes(d.status) ? `<button class="btn sm" data-act="repair-enc" data-id="${d.id}">Ꞩ Reparar acentuação / codificação</button>` : ""}</div><pre class="mono small muted">${esc(df.stat)}</pre>${renderDiff(df.diff)}</div>`;
   } else if (tab === "log") {
     body = `<div class="panel"><div class="feed tall" id="dfeed"></div></div>`;
   }
@@ -531,7 +547,7 @@ VIEWS.demanda = async (r, soft) => {
 function runHTML(x, compact) {
   const dur = x.finishedAt ? (new Date(x.finishedAt) - new Date(x.startedAt)) / 1000 : (Date.now() - new Date(x.startedAt)) / 1000;
   return `<div class="runcard"><div class="row"><b class="mono">Execução #${x.id}</b><span class="badge st-${esc(x.status)}">${esc(STATUS[x.status] || x.status)}</span><span class="badge">rev ${x.revisionNum}</span><span class="badge">${esc(stageLabel(x.stage))}</span><span class="grow"></span><span class="small muted">${fmtDate(x.startedAt)} · ${fmtDur(dur)}</span></div>
-  <div class="small muted" style="margin-top:6px">Provedor: ${esc(x.provider)} · Regras v<span class="mono">${esc(x.rulesHash)}</span>${x.costUsd ? ` · custo informado US$ ${x.costUsd.toFixed(4)}` : ""}${x.commitSha ? ` · commit <span class="mono">${esc(x.commitSha.slice(0, 10))}</span>` : ""}${x.sessionId ? ` · sessão <span class="mono">${esc(x.sessionId.slice(0, 8))}</span>` : ""}</div>
+  <div class="small muted" style="margin-top:6px">Provedor: ${esc(x.provider)} · Regras v<span class="mono">${esc(x.rulesHash)}</span>${x.costUsd ? ` · ${S.settings?.claude?.subscriptionOnly ? "equivalente em API (não cobrado)" : "custo informado"} US$ ${x.costUsd.toFixed(4)}` : ""}${x.commitSha ? ` · commit <span class="mono">${esc(x.commitSha.slice(0, 10))}</span>` : ""}${x.sessionId ? ` · sessão <span class="mono">${esc(x.sessionId.slice(0, 8))}</span>` : ""}</div>
   ${x.error ? `<div class="callout bad small" style="margin-top:8px">${esc(x.error)}</div>` : ""}
   ${x.diffStat ? `<pre class="mono small muted" style="white-space:pre-wrap">${esc(x.diffStat)}</pre>` : ""}
   ${x.summary ? (compact ? `<details><summary class="small">Resumo técnico da IA</summary><div class="md small">${md(x.summary)}</div></details>` : `<div class="md small">${md(x.summary)}</div>`) : ""}
@@ -577,6 +593,11 @@ document.addEventListener("click", async (e) => {
     if (act === "approve-review") { const note = prompt("Aprovar e concluir. Observação (opcional):", ""); if (note !== null) await guarded(() => api("POST", `/api/demands/${id}/approve-review`, { note }), "Missão concluída!"); }
     if (act === "approve-spec") await guarded(() => api("POST", `/api/demands/${id}/approve-spec`, { spec: $("#spec-edit")?.value || "" }), "Especificação aprovada");
     if (act === "adjust") return adjustModal(id);
+    if (act === "repair-enc") {
+      const r = await guarded(() => api("POST", `/api/demands/${id}/repair-encoding`));
+      toast(`Codificação: ${r.restored} arquivo(s) regravados, ${r.repaired.length} com acentuação recuperada${r.issues.length ? `, ${r.issues.length} problema(s) restantes (veja o log)` : ""}`, r.issues.length ? "err" : "ok");
+    }
+    if (act === "resume-queue") { await guarded(() => api("POST", "/api/queue/resume"), "Fila retomada"); }
     if (act === "delete") { if (confirm("Excluir a demanda do cadastro? A branch e a worktree no disco são preservadas.")) { const r = await guarded(() => api("DELETE", `/api/demands/${id}`)); toast(r.message); location.hash = "#/esteira"; await reloadDemands(); } return; }
     await reloadDemands().catch(() => {});
     render(true);
@@ -606,6 +627,9 @@ VIEWS.projetos = async (r) => {
       <label class="f"><span>Atalhos de branch base (separados por vírgula)</span><input type="text" name="branchOptions" value="${esc(p.branchOptions.join(", "))}" placeholder="release, main, main_versao, stage"><div class="help">Aparecem como atalhos no cadastro de demandas. Não são obrigatórios nem universais.</div></label>
       <div class="grid g2" style="gap:10px"><label class="f"><span>Prefixo das branches de trabalho</span><input type="text" name="branchPrefix" value="${esc(p.branchPrefix)}"></label>
         <label class="check" style="margin-top:22px"><input type="checkbox" name="autoCommit" ${p.autoCommit ? "checked" : ""}><span>Commit local automático na branch de trabalho<br><span class="help">Nunca faz push nem merge.</span></span></label></div>
+      <label class="f"><span>Codificação dos arquivos</span><select name="fileEncoding">
+        ${[["auto", "Automática — preserva a de cada arquivo; novos seguem a predominante do repositório"], ["windows-1252", "Windows-1252 (ANSI) para arquivos novos"], ["utf-8", "UTF-8 para arquivos novos"], ["utf-8-bom", "UTF-8 com BOM para arquivos novos"]].map(([v, l]) => `<option value="${v}" ${(p.fileEncoding || "auto") === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <div class="help">Arquivos existentes sempre mantêm a codificação e os finais de linha originais. Arquivos ANSI são convertidos temporariamente para UTF-8 enquanto a IA edita e devolvidos ao original em seguida.</div></label>
       <label class="f"><span>Comando de build (validação oficial)</span><input type="text" name="buildCommand" class="mono" value="${esc(p.buildCommand)}" placeholder="dotnet build Sistema.sln"></label>
       <label class="f"><span>Comando de testes (validação oficial)</span><input type="text" name="testCommand" class="mono" value="${esc(p.testCommand)}" placeholder="dotnet test --no-build"></label>
       <label class="f"><span>Comandos que a IA pode executar (prefixos, um por linha)</span><textarea name="agentBashAllow" class="mono" style="min-height:70px" placeholder="dotnet build&#10;dotnet test">${esc(p.agentBashAllow.join("\n"))}</textarea><div class="help">Comandos destrutivos, de rede ou com encadeamento (; & |) são rejeitados.</div></label>
@@ -632,7 +656,7 @@ VIEWS.projetos = async (r) => {
     e.preventDefault();
     const data = { name: f.name.value, path: f.path.value.trim(), language: f.language.value, mainSolution: f.mainSolution.value,
       branchOptions: f.branchOptions.value.split(",").map((s) => s.trim()).filter(Boolean), branchPrefix: f.branchPrefix.value, autoCommit: f.autoCommit.checked,
-      buildCommand: f.buildCommand.value.trim(), testCommand: f.testCommand.value.trim(), agentBashAllow: lines(f.agentBashAllow.value), standardsFiles: lines(f.standardsFiles.value), extraRules: f.extraRules.value };
+      buildCommand: f.buildCommand.value.trim(), testCommand: f.testCommand.value.trim(), agentBashAllow: lines(f.agentBashAllow.value), fileEncoding: f.fileEncoding.value, standardsFiles: lines(f.standardsFiles.value), extraRules: f.extraRules.value };
     const saved = await guarded(() => api(editing ? "PUT" : "POST", editing ? `/api/projects/${p.id}` : "/api/projects", data), "Projeto salvo");
     location.hash = `#/projetos/${saved.id}`; render();
   });
@@ -724,10 +748,11 @@ VIEWS.provedores = async () => {
     <div class="panel hud"><h2>Claude — Claude Code CLI</h2>${status("claude")}
       <div class="callout info small"><div>Pré-requisitos: instale o Claude Code (recomendado o instalador nativo — PowerShell: <span class="mono">irm https://claude.ai/install.ps1 | iex</span>) e execute <span class="mono">claude</span> uma vez no terminal para fazer login. Requer conta Pro, Max, Team, Enterprise ou Console (o plano gratuito não inclui o Claude Code). No Windows, instale o Git for Windows para que os comandos liberados ao agente funcionem. O uso consome a cota do plano ou é cobrado por tokens na API.</div></div>
       <label class="check"><input type="checkbox" name="cEnabled" ${c.enabled ? "checked" : ""}><span>Habilitado</span></label>
+      <label class="check"><input type="checkbox" name="cSubOnly" ${c.subscriptionOnly ? "checked" : ""}><span><b>Usar somente o limite da assinatura Pro/Max</b><br><span class="help">Ignora chaves de API do ambiente (ANTHROPIC_API_KEY etc.), interrompe a execução se a CLI estiver autenticada por chave de API ou se o "uso extra" pago for acionado, e pausa a fila quando o limite do plano acabar.</span></span></label>
       <label class="f"><span>Executável</span><input type="text" name="cBinary" class="mono" value="${esc(c.binary)}"><div class="help">Caminho completo se não estiver no PATH (ex.: C:\\Users\\voce\\.local\\bin\\claude.exe).</div></label>
       <label class="f"><span>Modelo padrão</span><input type="text" name="cModel" value="${esc(c.model)}" placeholder="padrão da CLI (ex.: sonnet, opus)"></label>
       <label class="f"><span>Modo de permissão no desenvolvimento</span><select name="cPerm">${["acceptEdits", "dontAsk", "default"].map((m) => `<option ${c.permissionMode === m ? "selected" : ""}>${m}</option>`).join("")}</select><div class="help">acceptEdits: aceita edições de arquivo; demais ações seguem a lista liberada. bypassPermissions nunca é usado.</div></label>
-      <label class="f"><span>Orçamento máximo por chamada (US$, opcional)</span><input type="number" step="0.5" name="cBudget" value="${c.maxBudgetUsd || ""}"></label>
+      <label class="f"><span>Orçamento máximo por chamada (US$, opcional — só se aplica a chave de API)</span><input type="number" step="0.5" name="cBudget" value="${c.maxBudgetUsd || ""}"></label>
       <label class="f"><span>Argumentos extras (avançado)</span><input type="text" name="cExtra" class="mono" value="${esc(c.extraArgs)}"></label>
       <button type="button" class="btn" data-test="claude">⚡ Testar conexão (chamada real mínima)</button><div id="t-claude" style="margin-top:10px"></div>
     </div>
@@ -746,13 +771,20 @@ VIEWS.provedores = async () => {
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const st = { ...S.settings, defaultProvider: f.defProv.value,
-      claude: { enabled: f.cEnabled.checked, binary: f.cBinary.value.trim() || "claude", model: f.cModel.value.trim(), permissionMode: f.cPerm.value, maxBudgetUsd: +f.cBudget.value || 0, extraArgs: f.cExtra.value.trim() },
+      claude: { enabled: f.cEnabled.checked, binary: f.cBinary.value.trim() || "claude", model: f.cModel.value.trim(), permissionMode: f.cPerm.value, maxBudgetUsd: +f.cBudget.value || 0, extraArgs: f.cExtra.value.trim(), subscriptionOnly: f.cSubOnly.checked },
       generic: { enabled: f.gEnabled.checked, name: f.gName.value, command: f.gCmd.value } };
     S.settings = await guarded(() => api("PUT", "/api/settings", st), "Provedores salvos"); render();
   });
   $$("[data-test]").forEach((b) => b.addEventListener("click", async () => {
     const out = $("#t-" + b.dataset.test); b.disabled = true; out.innerHTML = `<div class="small muted">◉ Testando… (pode levar alguns segundos)</div>`;
-    try { const r = await api("POST", `/api/providers/${b.dataset.test}/test`); out.innerHTML = `<div class="callout ${r.ok ? "good" : "bad"} small">${r.ok ? "✔ Conectado. Resposta: " : "⚠ "}${esc(r.message)}${r.cost ? ` · custo US$ ${r.cost.toFixed(4)}` : ""}</div>`; }
+    try {
+      const r = await api("POST", `/api/providers/${b.dataset.test}/test`);
+      const auth = r.authMode === "assinatura" ? "<b>Autenticação: assinatura (Pro/Max)</b> — consome apenas o limite do plano, sem cobrança por token."
+        : r.authMode === "chave_api" ? "<b>Autenticação: chave de API</b> — cobrada por token." : "";
+      const cost = r.cost ? (r.authMode === "assinatura" ? `<br><span class="dim">Valor equivalente em API (informativo, não cobrado): US$ ${r.cost.toFixed(4)}</span>` : `<br>Custo: US$ ${r.cost.toFixed(4)}`) : "";
+      const use = r.usage ? `<br>Uso do plano — 5h: ${Math.round(r.usage.fiveHourPct)}% · semana: ${Math.round(r.usage.sevenDayPct)}%` : "";
+      out.innerHTML = `<div class="callout ${r.ok ? "good" : "bad"} small"><div>${r.ok ? "✔ Conectado. Resposta: " : "⚠ "}${esc(r.message)}${auth ? "<br>" + auth : ""}${cost}${use}</div></div>`;
+    }
     catch (e) { out.innerHTML = `<div class="callout bad small">⚠ ${esc(e.message)}</div>`; }
     b.disabled = false;
   }));
@@ -799,6 +831,7 @@ VIEWS.notfound = async () => { $("#view").innerHTML = emptyState("Página não e
 (async function init() {
   try { await loadBase(); } catch (e) { $("#view").innerHTML = `<div class="callout bad">Não foi possível conectar ao servidor local: ${esc(e.message)}</div>`; return; }
   connectStream();
+  $(".brand small").textContent = "esteira IA · v" + S.meta.version;
   render();
   setInterval(() => { if (S.demands.some((d) => d.status === "executando") && ["esteira", "dashboard"].includes(route().name)) scheduleRender(); }, 15000);
 })();

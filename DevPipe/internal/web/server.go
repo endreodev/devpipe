@@ -18,9 +18,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"devpipe/internal/docs"
 	"devpipe/internal/domain"
+	"devpipe/internal/encx"
 	"devpipe/internal/gitx"
 	"devpipe/internal/pipeline"
 	"devpipe/internal/provider"
@@ -32,7 +34,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.1.0"
+const Version = "0.1.3"
 
 type Server struct {
 	st      *store.Store
@@ -53,7 +55,7 @@ func ConfigureProviders(reg *provider.Registry, s domain.Settings) {
 	reg.Remove("generico")
 	if s.Claude.Enabled {
 		reg.Register(&provider.Claude{Binary: s.Claude.Binary, DefaultModel: s.Claude.Model, PermissionMode: s.Claude.PermissionMode,
-			MaxBudgetUSD: s.Claude.MaxBudgetUSD, ExtraArgs: strings.Fields(s.Claude.ExtraArgs)})
+			MaxBudgetUSD: s.Claude.MaxBudgetUSD, ExtraArgs: strings.Fields(s.Claude.ExtraArgs), SubscriptionOnly: s.Claude.SubscriptionOnly})
 	}
 	if s.Generic.Enabled && strings.TrimSpace(s.Generic.Command) != "" {
 		reg.Register(&provider.Generic{DisplayName: s.Generic.Name, Command: s.Generic.Command})
@@ -105,6 +107,17 @@ func (s *Server) Handler() http.Handler {
 	h("POST /api/demands/{id}/adjust", s.adjust)
 	h("POST /api/demands/{id}/move", s.move)
 	h("GET /api/demands/{id}/diff", s.diff)
+	h("POST /api/demands/{id}/repair-encoding", func(w http.ResponseWriter, r *http.Request) (any, error) {
+		rep, err := s.eng.RepairEncoding(pid(r))
+		if err != nil {
+			return nil, err
+		}
+		issues := []string{}
+		for _, i := range rep.Issues {
+			issues = append(issues, i.String())
+		}
+		return map[string]any{"restored": len(rep.Restored), "repaired": rep.Repaired, "issues": issues}, nil
+	})
 	h("POST /api/queue/reorder", s.reorder)
 	mux.HandleFunc("GET /api/attachments/{id}", s.downloadAttachment)
 
@@ -121,6 +134,16 @@ func (s *Server) Handler() http.Handler {
 	h("GET /api/settings", func(w http.ResponseWriter, r *http.Request) (any, error) { return s.st.GetSettings() })
 	h("PUT /api/settings", s.saveSettings)
 	h("GET /api/providers", s.listProviders)
+	h("GET /api/usage", func(w http.ResponseWriter, r *http.Request) (any, error) {
+		u, paused := s.eng.Usage()
+		st, _ := s.st.GetSettings()
+		out := map[string]any{"usage": u, "subscriptionOnly": st.Claude.SubscriptionOnly}
+		if time.Now().Before(paused) {
+			out["pausedUntil"] = paused
+		}
+		return out, nil
+	})
+	h("POST /api/queue/resume", func(w http.ResponseWriter, r *http.Request) (any, error) { s.eng.ResumeQueue(); return nil, nil })
 	h("POST /api/providers/{id}/test", s.testProvider)
 
 	sub, _ := fs.Sub(staticFS, "static")
@@ -290,6 +313,11 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) (any, error
 	}
 	if p.MainSolution == "" {
 		p.MainSolution = ins.Solution
+	}
+	switch p.FileEncoding {
+	case "", "auto", "windows-1252", "utf-8", "utf-8-bom":
+	default:
+		return nil, errors.New("codificação inválida")
 	}
 	if p.ID == 0 && len(p.BranchOptions) == 0 {
 		p.BranchOptions = ins.Suggested
@@ -637,7 +665,7 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) (any, error) {
 		return map[string]string{"diff": "", "message": "Worktree não encontrada: " + d.WorktreePath}, nil
 	}
 	repo := gitx.Repo{Dir: d.WorktreePath}
-	return map[string]string{"diff": security.Redact(repo.Diff(d.BaseBranch, 400<<10)), "stat": repo.DiffStat(d.BaseBranch),
+	return map[string]string{"diff": security.Redact(displayText(repo.Diff(d.BaseBranch, 400<<10))), "stat": repo.DiffStat(d.BaseBranch),
 		"branch": d.WorkBranch, "base": d.BaseBranch, "worktree": d.WorktreePath}, nil
 }
 
@@ -832,10 +860,25 @@ func (s *Server) testProvider(w http.ResponseWriter, r *http.Request) (any, erro
 	var events []string
 	res, err := p.Run(ctx, provider.Request{Phase: provider.PhaseProbe, WorkDir: dir, Prompt: "Responda apenas com a palavra PRONTO."},
 		func(e provider.Event) { events = append(events, e.Message) })
+	s.eng.SetUsage(res.Usage)
 	if err != nil {
 		s.eng.SystemLog(domain.LevelError, "provedor", "Teste de conexão falhou: "+p.Name()+" — "+err.Error())
-		return map[string]any{"ok": false, "message": security.Redact(err.Error()), "events": events}, nil
+		return map[string]any{"ok": false, "message": security.Redact(err.Error()), "events": events, "authMode": res.AuthMode}, nil
 	}
-	s.eng.SystemLog(domain.LevelOK, "provedor", "Teste de conexão bem-sucedido: "+p.Name())
-	return map[string]any{"ok": true, "message": strings.TrimSpace(res.Text), "cost": res.CostUSD, "events": events}, nil
+	s.eng.SystemLog(domain.LevelOK, "provedor", "Teste de conexão bem-sucedido: "+p.Name()+" (autenticação: "+res.AuthMode+")")
+	return map[string]any{"ok": true, "message": strings.TrimSpace(res.Text), "cost": res.CostUSD, "events": events, "authMode": res.AuthMode, "usage": res.Usage}, nil
+}
+
+// displayText exibe corretamente diffs de arquivos Windows-1252 (linha a linha).
+func displayText(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		if !utf8.ValidString(l) {
+			lines[i] = encx.DecodeCP1252([]byte(l))
+		}
+	}
+	return strings.Join(lines, "\n")
 }

@@ -27,6 +27,60 @@ type Claude struct {
 	PermissionMode string // acceptEdits (padrão) | dontAsk | default
 	MaxBudgetUSD   float64
 	ExtraArgs      []string
+	// SubscriptionOnly: usar somente o login da assinatura (Pro/Max). Remove do
+	// ambiente as variáveis de chave de API, aborta se a CLI reportar outra
+	// fonte de autenticação e aborta se o "uso extra" pago for acionado.
+	SubscriptionOnly bool
+}
+
+// apiEnvVars direcionariam a CLI para cobrança fora da assinatura.
+var apiEnvVars = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+	"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"}
+
+// FilterEnv remove variáveis de cobrança por API (exportado para testes).
+func FilterEnv(env []string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		skip := false
+		for _, v := range apiEnvVars {
+			if strings.EqualFold(name, v) {
+				skip = true
+			}
+		}
+		if !skip {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+type rateLimitInfo struct {
+	Status         string `json:"status"`
+	ResetsAt       int64  `json:"resetsAt"`
+	RateLimitType  string `json:"rateLimitType"`
+	IsUsingOverage bool   `json:"isUsingOverage"`
+	Windows        map[string]struct {
+		Utilization float64 `json:"utilization"`
+		ResetsAt    int64   `json:"resetsAt"`
+	} `json:"unifiedWindows"`
+}
+
+func (r rateLimitInfo) usage() *PlanUsage {
+	u := &PlanUsage{Status: r.Status, LimitType: r.RateLimitType, UsingOverage: r.IsUsingOverage, UpdatedAt: time.Now().UTC()}
+	if r.ResetsAt > 0 {
+		u.ResetsAt = time.Unix(r.ResetsAt, 0).UTC()
+	}
+	if w, ok := r.Windows["five_hour"]; ok {
+		u.FiveHourPct, u.FiveHourEnds = w.Utilization*100, time.Unix(w.ResetsAt, 0).UTC()
+	}
+	if w, ok := r.Windows["seven_day"]; ok {
+		u.SevenDayPct, u.SevenDayEnds = w.Utilization*100, time.Unix(w.ResetsAt, 0).UTC()
+	}
+	return u
 }
 
 func (c *Claude) ID() string           { return "claude" }
@@ -114,7 +168,9 @@ type streamMsg struct {
 		ToolName  string          `json:"tool_name"`
 		ToolInput json.RawMessage `json:"tool_input"`
 	} `json:"permission_denials"`
-	Errors []string `json:"errors"`
+	Errors        []string        `json:"errors"`
+	APIKeySource  string          `json:"apiKeySource"`
+	RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 }
 
 type contentBlock struct {
@@ -132,9 +188,22 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 		return Result{}, errors.New("CLI do Claude Code não encontrada no PATH")
 	}
 	exe, args := resolveLauncher(path, c.BuildArgs(req))
-	cmd := exec.CommandContext(ctx, exe, args...)
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	cmd := exec.CommandContext(runCtx, exe, args...)
 	cmd.Dir = req.WorkDir
 	cmd.Env = os.Environ()
+	if c.SubscriptionOnly {
+		cmd.Env = FilterEnv(cmd.Env)
+	}
+	var policyErr error
+	abort := func(err error) {
+		if policyErr == nil {
+			policyErr = err
+			emit(Event{Kind: "politica_cobranca", Message: err.Error(), IsError: true})
+			stop()
+		}
+	}
 	cmd.WaitDelay = 5 * time.Second
 	procx.Prepare(cmd)
 	prompt := req.Prompt
@@ -173,7 +242,24 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 		case "system":
 			if m.Subtype == "init" {
 				res.SessionID = m.SessionID
-				emit(Event{Kind: "sessao", Message: "Sessão do agente iniciada", Detail: "modelo: " + m.Model})
+				res.AuthMode = authMode(m.APIKeySource)
+				emit(Event{Kind: "sessao", Message: "Sessão do agente iniciada — autenticação: " + authLabel(res.AuthMode), Detail: "modelo: " + m.Model + "\napiKeySource: " + m.APIKeySource})
+				if c.SubscriptionOnly && res.AuthMode != "assinatura" {
+					abort(&ErrPolicy{Msg: "Execução interrompida: o Claude Code está autenticado por chave de API (" + m.APIKeySource + "), mas a esteira está configurada para usar SOMENTE a assinatura Pro/Max. Rode 'claude' no terminal, use /logout e /login com a conta Pro, ou desative a opção em Provedores de IA."})
+				}
+			}
+		case "rate_limit_event":
+			var rl rateLimitInfo
+			if json.Unmarshal(m.RateLimitInfo, &rl) == nil {
+				u := rl.usage()
+				res.Usage = u
+				emit(Event{Kind: "uso_plano", Message: fmt.Sprintf("Uso da assinatura — janela 5h: %.0f%% · semana: %.0f%%", u.FiveHourPct, u.SevenDayPct), Usage: u})
+				if c.SubscriptionOnly && u.UsingOverage {
+					abort(&ErrPolicy{Msg: "Execução interrompida: o limite do plano acabou e a conta começou a usar 'uso extra' pago. A esteira está configurada para usar somente o limite da assinatura."})
+				}
+				if u.Status == "rejected" {
+					abort(&ErrPlanLimit{ResetsAt: u.ResetsAt})
+				}
 			}
 		case "assistant":
 			var msg struct{ Content []contentBlock }
@@ -217,6 +303,9 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 	wg.Wait()
 	waitErr := cmd.Wait()
 
+	if policyErr != nil {
+		return res, policyErr
+	}
 	if ctx.Err() != nil {
 		return res, fmt.Errorf("execução cancelada ou tempo limite excedido: %w", ctx.Err())
 	}
@@ -234,6 +323,26 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 		return res, fmt.Errorf("o agente reportou erro: %s", truncate(res.Text, 1500))
 	}
 	return res, nil
+}
+
+func authMode(src string) string {
+	switch src {
+	case "none":
+		return "assinatura" // login OAuth da conta claude.ai (Pro/Max/Team/Enterprise)
+	case "":
+		return "desconhecido"
+	}
+	return "chave_api" // ANTHROPIC_API_KEY, apiKeyHelper ou login do Console
+}
+
+func authLabel(m string) string {
+	switch m {
+	case "assinatura":
+		return "assinatura (Pro/Max) — sem cobrança por token"
+	case "chave_api":
+		return "chave de API — cobrança por token"
+	}
+	return "não identificada"
 }
 
 // resolveLauncher: no Windows, a instalação via npm cria "claude.cmd". Executar

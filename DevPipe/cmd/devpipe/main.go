@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -45,6 +46,26 @@ func main() {
 		return
 	}
 
+	// Porta primeiro: se outra instância estiver aberta, não tocamos no banco.
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		if v := runningVersion(*port); v != "" {
+			msg := fmt.Sprintf("Já existe um DevPipe %s em execução na porta %d. Feche-o antes de abrir esta versão (%s): Gerenciador de Tarefas > devpipe.exe > Finalizar tarefa.", v, *port, web.Version)
+			if v == web.Version {
+				msg = fmt.Sprintf("O DevPipe %s já está em execução em http://localhost:%d", v, *port)
+				if !*noOpen {
+					openBrowser(fmt.Sprintf("http://localhost:%d", *port))
+				}
+			}
+			log.Println(msg)
+			waitKey()
+			os.Exit(1)
+		}
+		log.Printf("porta %d indisponível: %v", *port, err)
+		waitKey()
+		os.Exit(1)
+	}
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 		log.Fatalf("não foi possível criar a pasta de dados: %v", err)
 	}
@@ -76,11 +97,6 @@ func main() {
 	eng.Start(ctx)
 	eng.SystemLog("info", "sistema", "DevPipe "+web.Version+" iniciado")
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("porta %d indisponível (já existe outra instância?): %v", *port, err)
-	}
 	srv := &http.Server{Handler: web.New(st, eng, reg, *dataDir, *port).Handler(), ReadHeaderTimeout: 10 * time.Second}
 	url := fmt.Sprintf("http://localhost:%d", *port)
 	log.Printf("DevPipe %s em %s  (dados: %s)", web.Version, url, *dataDir)
@@ -98,6 +114,29 @@ func main() {
 		log.Fatal(err)
 	}
 	time.Sleep(500 * time.Millisecond) // permite que execuções canceladas registrem o estado
+}
+
+// runningVersion pergunta a uma instância já aberta qual é a sua versão.
+func runningVersion(port int) string {
+	c := http.Client{Timeout: 2 * time.Second}
+	r, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d/api/meta", port))
+	if err != nil {
+		return ""
+	}
+	defer r.Body.Close()
+	var m struct{ Version string }
+	if json.NewDecoder(r.Body).Decode(&m) != nil {
+		return ""
+	}
+	return m.Version
+}
+
+// waitKey mantém a janela do console aberta no Windows para a mensagem ser lida.
+func waitKey() {
+	if runtime.GOOS == "windows" {
+		fmt.Println("\nPressione Enter para fechar...")
+		fmt.Scanln()
+	}
 }
 
 func openBrowser(url string) {

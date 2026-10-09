@@ -7,7 +7,36 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
+
+// PlanUsage: consumo da assinatura (Pro/Max) informado pela CLI do Claude Code.
+type PlanUsage struct {
+	Status       string    `json:"status"` // allowed | allowed_warning | rejected
+	LimitType    string    `json:"limitType"`
+	FiveHourPct  float64   `json:"fiveHourPct"`
+	FiveHourEnds time.Time `json:"fiveHourResetsAt"`
+	SevenDayPct  float64   `json:"sevenDayPct"`
+	SevenDayEnds time.Time `json:"sevenDayResetsAt"`
+	ResetsAt     time.Time `json:"resetsAt"`
+	UsingOverage bool      `json:"usingOverage"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// ErrPlanLimit: o limite da assinatura foi atingido; a fila deve aguardar.
+type ErrPlanLimit struct{ ResetsAt time.Time }
+
+func (e *ErrPlanLimit) Error() string {
+	if e.ResetsAt.IsZero() {
+		return "limite de uso da assinatura atingido"
+	}
+	return "limite de uso da assinatura atingido; libera em " + e.ResetsAt.Local().Format("02/01 15:04")
+}
+
+// ErrPolicy: execução interrompida por violar a política de cobrança/segurança.
+type ErrPolicy struct{ Msg string }
+
+func (e *ErrPolicy) Error() string { return e.Msg }
 
 // Phase indica o tipo de trabalho solicitado; cada provedor traduz isso em
 // permissões concretas.
@@ -37,6 +66,7 @@ type Event struct {
 	Message string
 	Detail  string
 	IsError bool
+	Usage   *PlanUsage // preenchido quando Kind == "uso_plano"
 }
 
 type Result struct {
@@ -46,6 +76,8 @@ type Result struct {
 	Turns     int
 	IsError   bool
 	Denials   []string
+	AuthMode  string // assinatura | chave_api | desconhecido
+	Usage     *PlanUsage
 }
 
 type Availability struct {

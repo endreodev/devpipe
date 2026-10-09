@@ -1,0 +1,25 @@
+{
+  // F5 no VS Code: executa o DevPipe com depurador (Delve).
+  // Dados de desenvolvimento ficam em ./.devdata, separados dos dados reais.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "DevPipe (depurar)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/devpipe",
+      "buildFlags": "-mod=vendor",
+      "args": ["-port", "7430", "-data", "${workspaceFolder}/.devdata"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Testes do pacote aberto (depurar)",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "buildFlags": "-mod=vendor"
+    }
+  ]
+}

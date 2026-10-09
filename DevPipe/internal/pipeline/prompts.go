@@ -11,20 +11,24 @@ import (
 const maxAttachmentText = 180 << 10 // limite total de texto de anexos no prompt
 
 type promptCtx struct {
-	D           domain.Demand
-	P           domain.Project
-	Rev         domain.Revision
-	Original    domain.Revision // revisão 1
-	Previous    []domain.Revision
-	Rules       string
-	Attachments []attachmentCtx
-	PrevSummary string   // resumo da última execução bem-sucedida (ajustes)
-	DiffStat    string   // alterações já existentes na branch de trabalho
-	AllowedCmds []string // prefixos de comando liberados ao agente
+	D            domain.Demand
+	P            domain.Project
+	Rev          domain.Revision
+	Original     domain.Revision // revisão 1
+	Previous     []domain.Revision
+	Rules        string
+	Attachments  []attachmentCtx
+	PrevSummary  string   // resumo da última execução bem-sucedida (ajustes)
+	DiffStat     string   // alterações já existentes na branch de trabalho
+	AllowedCmds  []string // prefixos de comando liberados ao agente
+	EncodingNote string   // aviso de codificação (projetos Windows-1252)
 }
 
 func commandsBlock(c promptCtx) string {
 	var b strings.Builder
+	if c.EncodingNote != "" {
+		b.WriteString("\n## CODIFICAÇÃO DOS ARQUIVOS\n" + c.EncodingNote + "\n")
+	}
 	b.WriteString("\n## COMANDOS QUE VOCÊ PODE EXECUTAR\n")
 	if len(c.AllowedCmds) == 0 {
 		b.WriteString("Nenhum comando de terminal está liberado para você neste projeto. Não tente executar comandos: use apenas as ferramentas de leitura e edição de arquivos. A aplicação executará o build e os testes oficiais após sua implementação.\n")

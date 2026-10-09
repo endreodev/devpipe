@@ -1,0 +1,8 @@
+{
+  "go.buildFlags": ["-mod=vendor"],
+  "go.testFlags": ["-mod=vendor", "-count=1"],
+  "go.toolsEnvVars": { "GOFLAGS": "-mod=vendor" },
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "[go]": { "editor.formatOnSave": true }
+}

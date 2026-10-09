@@ -108,7 +108,9 @@ func TestFullCycleWithFixAndAdjustment(t *testing.T) {
 	if err := e.Enqueue(d.ID); err != nil {
 		t.Fatal(err)
 	}
-	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Stage == domain.StageReview || x.Stage == domain.StageBlocked })
+	got := waitFor(t, st, d.ID, func(x domain.Demand) bool {
+		return (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
+	})
 	if got.Stage != domain.StageReview || got.ValidationState != "ok" {
 		t.Fatalf("esperava revisão com validação ok, obtido %s %s %s", got.Stage, got.ValidationState, got.StatusMessage)
 	}
@@ -146,7 +148,7 @@ func TestFullCycleWithFixAndAdjustment(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = waitFor(t, st, d.ID, func(x domain.Demand) bool {
-		return x.CurrentRevision == 2 && (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && x.Status != domain.StatusRunning
+		return x.CurrentRevision == 2 && (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
 	})
 	if got.Stage != domain.StageReview {
 		t.Fatalf("ajuste não chegou à revisão: %s %s", got.Stage, got.StatusMessage)
@@ -174,7 +176,7 @@ func TestValidationKeepsFailingBlocks(t *testing.T) {
 	d := domain.Demand{Ticket: "X-1", Title: "falha", ProjectID: p.ID, Provider: "generico"}
 	st.CreateDemand(&d, "x")
 	e.Enqueue(d.ID)
-	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Stage == domain.StageBlocked })
+	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Stage == domain.StageBlocked && !e.IsRunning(x.ID) })
 	if got.BlockedFrom != domain.StageValidation || got.ValidationState != "falhou" {
 		t.Fatalf("esperava bloqueio na validação: %+v", got)
 	}
@@ -189,7 +191,7 @@ func TestSpecApprovalGateAndCancel(t *testing.T) {
 	d := domain.Demand{Ticket: "Y-1", Title: "gate", ProjectID: p.ID, Provider: "generico", ReviewSpec: true}
 	st.CreateDemand(&d, "y")
 	e.Enqueue(d.ID)
-	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Status == domain.StatusAwaitingApproval })
+	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Status == domain.StatusAwaitingApproval && !e.IsRunning(x.ID) })
 	if got.Stage != domain.StagePlanning {
 		t.Fatalf("gate: %+v", got)
 	}

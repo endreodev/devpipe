@@ -323,3 +323,93 @@ func DetectStack(dir string) (lang, solution string) {
 	}
 	return
 }
+
+// TrackedFiles lista os arquivos versionados (caminhos relativos, com "/").
+func (r Repo) TrackedFiles() ([]string, error) {
+	out, err := r.gitRaw("-c", "core.quotepath=false", "ls-files", "-z")
+	if err != nil {
+		return nil, err
+	}
+	return splitZ(out), nil
+}
+
+// ChangedPaths lista arquivos modificados, novos ou não rastreados (sem os removidos).
+func (r Repo) ChangedPaths() ([]string, error) {
+	out, err := r.gitRaw("-c", "core.quotepath=false", "status", "--porcelain", "-z", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	entries := splitZ(out)
+	for i := 0; i < len(entries); i++ {
+		e := entries[i]
+		if len(e) < 4 {
+			continue
+		}
+		x, y, path := e[0], e[1], e[3:]
+		if x == 'R' || x == 'C' {
+			i++ // o próximo campo é o caminho de origem
+		}
+		if x == 'D' || y == 'D' {
+			continue
+		}
+		files = append(files, path)
+	}
+	return files, nil
+}
+
+// FilesChangedSince lista arquivos alterados em commits desde a referência.
+func (r Repo) FilesChangedSince(ref string) []string {
+	out, err := r.gitRaw("-c", "core.quotepath=false", "diff", "--name-only", "-z", "--diff-filter=AMR", ref, "HEAD")
+	if err != nil {
+		return nil
+	}
+	return splitZ(out)
+}
+
+// MergeBase devolve o ancestral comum entre base e HEAD.
+func (r Repo) MergeBase(base string) string {
+	s, err := r.git("merge-base", base, "HEAD")
+	if err != nil {
+		return ""
+	}
+	return s
+}
+
+// ShowFile devolve o conteúdo de um arquivo em uma revisão (ok=false se não existir).
+func (r Repo) ShowFile(rev, path string) ([]byte, bool) {
+	if rev == "" {
+		return nil, false
+	}
+	out, err := r.gitRaw("show", rev+":"+path)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// gitRaw executa sem aparar a saída (conteúdo binário/exato).
+func (r Repo) gitRaw(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = r.Dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	hideWindow(cmd)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(errb.String()))
+	}
+	return out.Bytes(), nil
+}
+
+func splitZ(b []byte) []string {
+	var out []string
+	for _, p := range bytes.Split(b, []byte{0}) {
+		if len(p) > 0 {
+			out = append(out, string(p))
+		}
+	}
+	return out
+}

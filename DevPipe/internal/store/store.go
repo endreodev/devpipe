@@ -167,6 +167,7 @@ var migrations = []string{
 		changed_at TIMESTAMP NOT NULL
 	);
 	CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
+	`ALTER TABLE projects ADD COLUMN file_encoding TEXT DEFAULT 'auto';`,
 }
 
 func (s *Store) migrate() error {

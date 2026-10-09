@@ -76,6 +76,7 @@ Como a CLI é chamada:
 - `bypassPermissions` é recusado pela aplicação.
 - Prompt via **stdin** (sem limite de linha de comando); `--append-system-prompt` com a política de segurança em linha única; `--add-dir` com a pasta de anexos (para o Claude ler PDFs e imagens diretamente); `--resume <sessão>` nas correções.
 - No Windows, se a CLI for um wrapper `.cmd` com `cli.js` ao lado, o `cli.js` é executado diretamente via `node` (o `cmd.exe` corromperia argumentos).
+- **Modo somente assinatura** (padrão): variáveis de API removidas do ambiente do processo; o evento `system/init` informa `apiKeySource` — só `"none"` (login da assinatura) é aceito; o evento `rate_limit_event` informa o consumo das janelas de 5 h e semanal e `isUsingOverage` — uso extra pago interrompe a execução; `status: rejected` (limite atingido) devolve a demanda à fila na mesma etapa e pausa o agendador até `resetsAt`.
 - Cada evento (`assistant`/`tool_use`, `tool_result` com erro, `result` com custo e `permission_denials`) vira um evento do monitor.
 
 ## 4. Modelo de persistência (SQLite)
@@ -130,6 +131,19 @@ O texto composto recebe um hash SHA-256 (16 caracteres) gravado em cada execuç�
 | Execuções presas | Tempo limite por chamada do agente e por comando; cancelamento encerra a árvore de processos |
 | Conflito no mesmo repositório | Lock por repositório no agendador |
 | Anexos maliciosos | Executáveis/scripts recusados; nomes de arquivo sanitizados; limite de 50 MB; download servido como anexo |
+
+## 6.1 Proteção de codificação (`internal/encx`)
+
+Problema observado em produção: em projetos Windows-1252, a ferramenta de edição do agente lê o arquivo como UTF-8 (cada acento vira U+FFFD) e regrava o arquivo inteiro em UTF-8. Instruções no prompt não evitam isso, pois a conversão ocorre na ferramenta.
+
+| Etapa | O que acontece |
+|---|---|
+| `Prepare` (antes de cada chamada de desenvolvimento/correção) | Varre os arquivos versionados de texto da worktree; os que não são UTF-8 válido são decodificados como Windows-1252 (tabela própria, ida e volta sem perdas inclusive para os 5 bytes indefinidos) e gravados em UTF-8. Registra a codificação original e a predominante do repositório. |
+| Agente edita | Vê a acentuação correta. O prompt informa que a reconversão é automática e pede somente caracteres representáveis em Windows-1252. |
+| `Restore` (sempre, mesmo se o agente falhar) | Para cada arquivo alterado (worktree e commits desde o merge-base): codificação alvo = original registrada › codificação na branch base › padrão do projeto. Preserva BOM e CRLF (quando a base era 100% CRLF). Recupera U+FFFD por correspondência com o vocabulário da versão base (uma sequência de U+FFFD casa 1+ caracteres não-ASCII; só corrige quando há candidata única). |
+| Validação | Problemas restantes (U+FFFD sem candidata, caracteres fora de Windows-1252) reprovam a validação e entram no ciclo de correção da IA. |
+
+O diff exibido na interface decodifica linhas Windows-1252 para exibição. A ação "Reparar acentuação" executa apenas o `Restore` em uma worktree existente (branches afetadas por versões anteriores) e faz commit local.
 
 ## 7. Pontos de extensão
 

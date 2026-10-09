@@ -70,7 +70,13 @@ O DevPipe executa o **Claude Code CLI** em modo não interativo (`claude -p --ou
 3. No DevPipe, abra **Provedores de IA** e clique em **Testar conexão** (faz uma chamada real mínima e mostra o custo informado).
 4. Se o `claude` não estiver no `PATH`, informe o caminho completo (ex.: `C:\Users\voce\.local\bin\claude.exe`).
 
-**Custos e limites** — cada demanda faz ao menos duas chamadas ao agente (análise e desenvolvimento) e, se a validação falhar, até N chamadas de correção (configurável). Com assinatura, o uso consome a cota do seu plano; com chave de API, é cobrado por tokens. O custo informado pela CLI aparece em cada execução e no painel. Assinatura e acesso à API são produtos distintos: ter um não implica ter o outro. Documentação oficial: <https://code.claude.com/docs/en/setup>.
+**Somente assinatura Pro (padrão: ligado)** — em *Provedores de IA*, a opção "Usar somente o limite da assinatura Pro/Max" garante que a esteira não gere cobrança fora do plano:
+- remove do processo do Claude as variáveis que direcionariam para cobrança por API (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex/Foundry);
+- confere a fonte de autenticação informada pela CLI a cada chamada e **interrompe** a execução se não for o login da assinatura;
+- **interrompe** se a conta começar a usar "uso extra" pago;
+- quando o limite do plano acaba, **pausa a fila** e retoma sozinha no horário de liberação (ou pelo botão "Retomar agora" na Central).
+
+A Central mostra o consumo do plano (janela de 5 h e semanal). O valor em US$ exibido nas execuções é o **equivalente em API, apenas informativo** — não é cobrado na assinatura. Cada demanda faz ao menos duas chamadas (análise e desenvolvimento) e, se a validação falhar, até N correções (configurável); para poupar o limite, mantenha 1 demanda em paralelo e 1–2 tentativas de correção. Documentação oficial: <https://code.claude.com/docs/en/setup>.
 
 **Outros agentes** — o provedor **CLI genérico** executa qualquer agente de linha de comando (prompt via stdin, variáveis `DEVPIPE_PHASE` e `DEVPIPE_WORKDIR`). Novos provedores nativos são adicionados implementando a interface em `internal/provider/provider.go`.
 
@@ -86,6 +92,17 @@ O DevPipe executa o **Claude Code CLI** em modo não interativo (`claude -p --ou
 4. **Nova demanda** → ticket, título, prioridade, requisitos, branch base e anexos (PDF, DOCX, DOC, TXT, MD, imagens — inclusive prints colados com Ctrl+V). Clique em **Criar e colocar na fila**.
 5. Acompanhe na **Esteira** e no **Monitor**. Na **Revisão**, inspecione o diff e escolha **Aprovar e concluir** ou **Devolver para ajustes** (com novas instruções e anexos).
 6. Para integrar o resultado, faça o merge da branch `devpipe/...` pelo seu fluxo normal (o DevPipe nunca faz merge/push).
+
+## 4.1 Codificação de arquivos (ANSI / Windows-1252)
+
+As ferramentas de edição dos agentes de IA trabalham em UTF-8. Em projetos ANSI (Windows-1252), editar um arquivo diretamente faria todos os acentos virarem `�` (no editor aparece `permissï¿½es`). Isso **não** é resolvido por regras ou instruções ao modelo — a esteira resolve de forma determinística:
+
+1. Antes de cada edição da IA, os arquivos Windows-1252 da worktree são convertidos **sem perdas** para UTF-8.
+2. Depois, cada arquivo alterado volta à codificação original (Windows-1252, UTF-8 ou UTF-8 com BOM), preservando CRLF.
+3. Caracteres `�` introduzidos são recuperados pelo vocabulário da versão original do arquivo; o que não puder ser recuperado com certeza, ou caracteres inexistentes em Windows-1252 (ex.: `→`, emojis), **reprovam a validação** e a IA é chamada para corrigir.
+4. Arquivos novos seguem a opção *Codificação dos arquivos* do projeto (padrão: a predominante do repositório).
+
+**Branches corrompidas por versões anteriores:** abra a demanda → aba *Alterações (diff)* → **Reparar acentuação / codificação**. O reparo também é aplicado automaticamente ao Retomar ou Devolver para ajustes.
 
 ## 5. Projeto de demonstração
 
@@ -117,6 +134,7 @@ internal/pipeline/      orquestrador: fila, locks por repositório, etapas, vali
 internal/provider/      abstração de agentes de IA: Claude Code CLI e CLI genérico
 internal/gitx/          Git: validação, branches, worktrees isoladas, diff, commit local
 internal/docs/          extração de PDF/DOCX/DOC/TXT/MD e classificação de imagens
+internal/encx/          proteção de codificação (Windows-1252 ⇄ UTF-8, BOM, CRLF, reparo de '�')
 internal/rules/         composição das regras com precedência e hash de versão
 internal/security/      diretórios autorizados, redação de segredos, classificação de comandos
 internal/web/           API REST, SSE (tempo real) e interface embutida (static/)

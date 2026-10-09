@@ -13,13 +13,13 @@ import (
 
 // ---------- Projetos ----------
 
-const projectCols = `id,name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,branch_prefix,auto_commit,created_at,updated_at`
+const projectCols = `id,name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,branch_prefix,auto_commit,file_encoding,created_at,updated_at`
 
 func scanProject(r interface{ Scan(...any) error }) (domain.Project, error) {
 	var p domain.Project
 	var bo, sf, ab string
 	var ac int
-	err := r.Scan(&p.ID, &p.Name, &p.Path, &p.Language, &p.MainSolution, &bo, &sf, &p.ExtraRules, &p.BuildCommand, &p.TestCommand, &ab, &p.BranchPrefix, &ac, &p.CreatedAt, &p.UpdatedAt)
+	err := r.Scan(&p.ID, &p.Name, &p.Path, &p.Language, &p.MainSolution, &bo, &sf, &p.ExtraRules, &p.BuildCommand, &p.TestCommand, &ab, &p.BranchPrefix, &ac, &p.FileEncoding, &p.CreatedAt, &p.UpdatedAt)
 	p.BranchOptions, p.StandardsFiles, p.AgentBashAllow = fromJSONList(bo), fromJSONList(sf), fromJSONList(ab)
 	p.AutoCommit = ac == 1
 	return p, err
@@ -55,11 +55,14 @@ func (s *Store) SaveProject(p *domain.Project) error {
 	if p.BranchPrefix == "" {
 		p.BranchPrefix = "devpipe/"
 	}
+	if p.FileEncoding == "" {
+		p.FileEncoding = "auto"
+	}
 	if p.ID == 0 {
 		p.CreatedAt = t
 		p.UpdatedAt = t
-		res, err := s.db.Exec(`INSERT INTO projects(name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,branch_prefix,auto_commit,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.BranchPrefix, b2i(p.AutoCommit), t, t)
+		res, err := s.db.Exec(`INSERT INTO projects(name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,branch_prefix,auto_commit,file_encoding,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.BranchPrefix, b2i(p.AutoCommit), p.FileEncoding, t, t)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return fmt.Errorf("já existe um projeto cadastrado com este caminho")
@@ -70,8 +73,8 @@ func (s *Store) SaveProject(p *domain.Project) error {
 		return nil
 	}
 	p.UpdatedAt = t
-	_, err := s.db.Exec(`UPDATE projects SET name=?,path=?,language=?,main_solution=?,branch_options=?,standards_files=?,extra_rules=?,build_command=?,test_command=?,agent_bash_allow=?,branch_prefix=?,auto_commit=?,updated_at=? WHERE id=?`,
-		p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.BranchPrefix, b2i(p.AutoCommit), t, p.ID)
+	_, err := s.db.Exec(`UPDATE projects SET name=?,path=?,language=?,main_solution=?,branch_options=?,standards_files=?,extra_rules=?,build_command=?,test_command=?,agent_bash_allow=?,branch_prefix=?,auto_commit=?,file_encoding=?,updated_at=? WHERE id=?`,
+		p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.BranchPrefix, b2i(p.AutoCommit), p.FileEncoding, t, p.ID)
 	return err
 }
 

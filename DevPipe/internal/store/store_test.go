@@ -97,3 +97,14 @@ func TestRuleVersioningAndSettings(t *testing.T) {
 		t.Fatalf("settings: %+v", st2)
 	}
 }
+
+// Configurações salvas por versões anteriores (sem o campo) devem assumir
+// "somente assinatura" = ligado.
+func TestSubscriptionOnlyDefaultsOnForOldSettings(t *testing.T) {
+	s := newStore(t)
+	s.DB().Exec(`INSERT INTO settings(key,value) VALUES('app','{"maxParallel":1,"claude":{"enabled":true,"binary":"claude"}}')`)
+	st, err := s.GetSettings()
+	if err != nil || !st.Claude.SubscriptionOnly {
+		t.Fatalf("esperava subscriptionOnly=true, obtido %+v %v", st.Claude, err)
+	}
+}

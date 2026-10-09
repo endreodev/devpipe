@@ -18,6 +18,7 @@ import (
 
 	"devpipe/internal/docs"
 	"devpipe/internal/domain"
+	"devpipe/internal/encx"
 	"devpipe/internal/gitx"
 	"devpipe/internal/procx"
 	"devpipe/internal/provider"
@@ -36,6 +37,34 @@ type Engine struct {
 	running   map[int64]context.CancelFunc
 	repoLocks map[string]int64
 	wake      chan struct{}
+
+	usage       *provider.PlanUsage // último uso da assinatura informado pela CLI
+	pausedUntil time.Time           // fila pausada até a liberação do limite do plano
+}
+
+// Usage devolve o último consumo conhecido da assinatura e a pausa da fila.
+func (e *Engine) Usage() (*provider.PlanUsage, time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.usage, e.pausedUntil
+}
+
+func (e *Engine) SetUsage(u *provider.PlanUsage) {
+	if u == nil {
+		return
+	}
+	e.mu.Lock()
+	e.usage = u
+	e.mu.Unlock()
+	e.bus.Publish(Message{Type: "usage", Data: u})
+}
+
+// ResumeQueue remove a pausa por limite do plano (ação manual).
+func (e *Engine) ResumeQueue() {
+	e.mu.Lock()
+	e.pausedUntil = time.Time{}
+	e.mu.Unlock()
+	e.Wake()
 }
 
 func New(st *store.Store, reg *provider.Registry, bus *Bus, dataDir string) *Engine {
@@ -122,6 +151,12 @@ func (e *Engine) recover() {
 }
 
 func (e *Engine) schedule() {
+	e.mu.Lock()
+	paused := time.Now().Before(e.pausedUntil)
+	e.mu.Unlock()
+	if paused {
+		return // aguardando liberação do limite da assinatura
+	}
 	st, _ := e.st.GetSettings()
 	max := st.MaxParallel
 	if max < 1 {
@@ -235,10 +270,11 @@ func (e *Engine) SystemLog(level, kind, msg string) {
 // ---------------------------------------------------------------- execução
 
 type runState struct {
-	d        *domain.Demand
-	run      *domain.Run
-	started  time.Time
-	baseSecs int64
+	d         *domain.Demand
+	run       *domain.Run
+	started   time.Time
+	baseSecs  int64
+	encIssues []encx.Issue // problemas de codificação pendentes (viram falha de validação)
 }
 
 func (e *Engine) setStage(rs *runState, s domain.Stage, status, msg string) {
@@ -343,7 +379,14 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	e.log(d, run.ID, domain.LevelInfo, "inicio", fmt.Sprintf("Demanda iniciada — revisão %d, tentativa %d, provedor %s", rev.Number, d.Attempts, prov.Name()),
 		"Regras utilizadas: versão "+composed.Hash)
 
-	fail := func(stage domain.Stage, err error) { e.block(&d, run, stage, err) }
+	fail := func(stage domain.Stage, err error) {
+		var lim *provider.ErrPlanLimit
+		if errors.As(err, &lim) {
+			e.waitPlanLimit(&d, run, stage, lim)
+			return
+		}
+		e.block(&d, run, stage, err)
+	}
 	agentTimeout := time.Duration(max(settings.AgentTimeoutMin, 5)) * time.Minute
 
 	// --- documentos
@@ -439,12 +482,16 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	if skipDev {
 		e.log(d, run.ID, domain.LevelInfo, "retomada", "Retomando pela validação: a implementação desta revisão já existe na worktree", "")
 		devSummary = e.lastSummary(d.ID)
+		e.encRestore(rs, p, wt, nil) // repara branches afetadas por versões anteriores
 	} else {
 		e.setStage(rs, domain.StageDev, domain.StatusRunning, "IA implementando as alterações")
+		man := e.encPrepare(rs, wt)
+		pc.EncodingNote = encodingNote(man)
 		dctx, cancel := context.WithTimeout(ctx, agentTimeout)
 		res, err := prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
 			Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model}, e.agentEmitter(rs))
 		cancel()
+		e.encRestore(rs, p, wt, man) // sempre, mesmo se o agente falhar
 		run.CostUSD += res.CostUSD
 		run.SessionID = res.SessionID
 		e.st.UpdateRun(*run)
@@ -472,16 +519,25 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		d.StatusMessage = fmt.Sprintf("Corrigindo falhas de validação (tentativa %d)", attempt)
 		e.touch(&d, d.StatusMessage)
 		e.save(&d)
+		fman := e.encPrepare(rs, wt)
+		pc.EncodingNote = encodingNote(fman)
 		fctx, cancel := context.WithTimeout(ctx, agentTimeout)
 		res, err := prov.Run(fctx, provider.Request{Phase: provider.PhaseFix, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
 			Prompt: fixPrompt(pc, rev.Spec, output, attempt), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
 			ResumeSession: run.SessionID}, e.agentEmitter(rs))
 		cancel()
+		e.encRestore(rs, p, wt, fman)
 		run.CostUSD += res.CostUSD
 		if res.SessionID != "" {
 			run.SessionID = res.SessionID
 		}
 		if err != nil {
+			var lim *provider.ErrPlanLimit
+			var pol *provider.ErrPolicy
+			if errors.As(err, &lim) || errors.As(err, &pol) {
+				fail(domain.StageValidation, err)
+				return
+			}
 			e.log(d, run.ID, domain.LevelError, "correcao", "A tentativa de correção falhou", err.Error())
 			break
 		}
@@ -518,6 +574,115 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	e.setStage(rs, domain.StageReview, domain.StatusAwaitingApproval, "Alterações prontas para inspeção humana")
 	e.log(d, run.ID, domain.LevelAuth, "revisao", "Revisão disponibilizada: inspecione o diff e aprove ou devolva para ajustes",
 		"Branch: "+d.WorkBranch+"\nWorktree: "+wt+"\n\n"+run.DiffStat)
+}
+
+// waitPlanLimit: o limite da assinatura acabou. A demanda volta para a fila na
+// mesma etapa (o trabalho já feito na worktree é preservado) e a fila inteira
+// pausa até a liberação; nada é executado com cobrança extra.
+func (e *Engine) waitPlanLimit(d *domain.Demand, run *domain.Run, stage domain.Stage, lim *provider.ErrPlanLimit) {
+	until := lim.ResetsAt
+	if until.IsZero() || until.Before(time.Now()) {
+		until = time.Now().Add(30 * time.Minute)
+	}
+	e.mu.Lock()
+	e.pausedUntil = until.Add(1 * time.Minute)
+	e.mu.Unlock()
+	if stage == domain.StageBlocked {
+		stage = d.BlockedFrom
+	}
+	d.Stage, d.Status = stage, domain.StatusQueued
+	d.StatusMessage = "Limite da assinatura atingido. A fila foi pausada e esta demanda continua automaticamente em " + until.Local().Format("02/01 15:04") + "."
+	e.touch(d, d.StatusMessage)
+	e.save(d)
+	if run != nil {
+		t := time.Now().UTC()
+		run.Status, run.Error, run.FinishedAt = domain.StatusCancelled, lim.Error(), &t
+		e.st.UpdateRun(*run)
+	}
+	e.log(*d, runID(run), domain.LevelWarn, "limite_plano", d.StatusMessage, "")
+}
+
+// encPrepare converte temporariamente arquivos Windows-1252 para UTF-8, para que
+// as ferramentas de edição do agente não corrompam a acentuação.
+func (e *Engine) encPrepare(rs *runState, wt string) *encx.Manifest {
+	m, err := encx.Prepare(wt)
+	if err != nil {
+		e.log(*rs.d, rs.run.ID, domain.LevelWarn, "codificacao", "Não foi possível preparar a codificação dos arquivos", err.Error())
+	}
+	if m != nil && len(m.Converted) > 0 {
+		e.log(*rs.d, rs.run.ID, domain.LevelInfo, "codificacao",
+			fmt.Sprintf("Codificação protegida: %d arquivo(s) Windows-1252 convertidos temporariamente para UTF-8 durante a edição da IA", len(m.Converted)), "")
+	} else if m != nil {
+		e.log(*rs.d, rs.run.ID, domain.LevelInfo, "codificacao",
+			fmt.Sprintf("Codificação verificada: nenhum arquivo ANSI/Windows-1252 encontrado (%d arquivo(s) UTF-8 com acentos)", m.UTF8), "")
+	}
+	return m
+}
+
+// encRestore devolve os arquivos à codificação original e repara '�'.
+func (e *Engine) encRestore(rs *runState, p domain.Project, wt string, m *encx.Manifest) {
+	repo := gitx.Repo{Dir: wt}
+	rep := encx.Restore(wt, repo.MergeBase(rs.d.BaseBranch), m, p.FileEncoding)
+	rs.encIssues = rep.Issues
+	if m != nil && len(m.Converted) > 0 {
+		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", "Arquivos devolvidos à codificação original (Windows-1252, finais de linha preservados)", "")
+	}
+	if len(rep.Restored) > 0 {
+		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", fmt.Sprintf("%d arquivo(s) regravados na codificação original do projeto", len(rep.Restored)), strings.Join(rep.Restored, "\n"))
+	}
+	if len(rep.Repaired) > 0 {
+		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", fmt.Sprintf("Acentuação recuperada automaticamente em %d arquivo(s)", len(rep.Repaired)), strings.Join(rep.Repaired, "\n"))
+	}
+	if len(rep.Issues) > 0 {
+		var b strings.Builder
+		for _, is := range rep.Issues {
+			b.WriteString(is.String() + "\n")
+		}
+		e.log(*rs.d, rs.run.ID, domain.LevelWarn, "codificacao", fmt.Sprintf("%d problema(s) de codificação a corrigir", len(rep.Issues)), b.String())
+	}
+}
+
+func encodingNote(m *encx.Manifest) string {
+	if m == nil || (len(m.Converted) == 0 && m.Predominant != encx.CP1252) {
+		return ""
+	}
+	return "Os arquivos deste projeto usam a codificação Windows-1252 (ANSI). A aplicação os converteu temporariamente para UTF-8 para que você os leia e edite corretamente, e os devolverá automaticamente à codificação original ao final. " +
+		"Escreva normalmente com acentuação em português. Não converta codificação, não altere finais de linha e não reescreva arquivos inteiros. " +
+		"Use somente caracteres que existem em Windows-1252: evite setas (→), emojis, símbolos matemáticos especiais e caracteres de outros alfabetos."
+}
+
+// RepairEncoding executa somente o reparo de codificação na worktree da
+// demanda (branches afetadas por versões anteriores) e faz commit local.
+func (e *Engine) RepairEncoding(id int64) (encx.Report, error) {
+	d, err := e.load(id)
+	if err != nil {
+		return encx.Report{}, err
+	}
+	if d.WorktreePath == "" || !dirExists(d.WorktreePath) {
+		return encx.Report{}, errors.New("a demanda ainda não possui branch de trabalho")
+	}
+	p, err := e.st.GetProject(d.ProjectID)
+	if err != nil {
+		return encx.Report{}, err
+	}
+	repo := gitx.Repo{Dir: d.WorktreePath}
+	rep := encx.Restore(d.WorktreePath, repo.MergeBase(d.BaseBranch), nil, p.FileEncoding)
+	msg := fmt.Sprintf("Reparo de codificação: %d arquivo(s) regravados, %d com acentuação recuperada, %d problema(s) restantes", len(rep.Restored), len(rep.Repaired), len(rep.Issues))
+	var det strings.Builder
+	for _, is := range rep.Issues {
+		det.WriteString(is.String() + "\n")
+	}
+	level := domain.LevelOK
+	if len(rep.Issues) > 0 {
+		level = domain.LevelWarn
+	}
+	e.log(d, 0, level, "codificacao", msg, det.String())
+	if p.AutoCommit && len(repo.ChangedFiles()) > 0 {
+		if sha, err := repo.CommitAll(d.Ticket + ": correção de codificação de caracteres (DevPipe)"); err == nil && sha != "" {
+			e.log(d, 0, domain.LevelOK, "git", "Commit local de reparo criado ("+sha[:min(10, len(sha))]+")", "")
+		}
+	}
+	return rep, nil
 }
 
 func (e *Engine) commitIfConfigured(rs *runState, p domain.Project, repo gitx.Repo, rev domain.Revision) {
@@ -597,10 +762,19 @@ func (e *Engine) validate(ctx context.Context, rs *runState, p domain.Project, w
 	if strings.TrimSpace(p.TestCommand) != "" {
 		steps = append(steps, step{"Testes", p.TestCommand})
 	}
+	d := rs.d
+	if len(rs.encIssues) > 0 {
+		var b strings.Builder
+		b.WriteString("PROBLEMAS DE CODIFICAÇÃO DE CARACTERES (a acentuação precisa ser corrigida):\n")
+		for _, is := range rs.encIssues {
+			b.WriteString("- " + is.String() + "\n")
+		}
+		e.log(*d, rs.run.ID, domain.LevelError, "codificacao", fmt.Sprintf("Validação de codificação falhou: %d problema(s)", len(rs.encIssues)), b.String())
+		return false, b.String(), true
+	}
 	if len(steps) == 0 {
 		return true, "", false
 	}
-	d := rs.d
 	var all strings.Builder
 	for _, s := range steps {
 		if err := security.CheckValidationCommand(s.cmd); err != nil {
@@ -640,8 +814,16 @@ func runShell(ctx context.Context, dir, script string, timeout time.Duration) (s
 
 func (e *Engine) agentEmitter(rs *runState) func(provider.Event) {
 	return func(ev provider.Event) {
+		if ev.Usage != nil {
+			e.SetUsage(ev.Usage)
+			if ev.Usage.FiveHourPct < 80 && ev.Usage.SevenDayPct < 80 {
+				return // não poluir o log; o painel mostra o consumo
+			}
+		}
 		level := domain.LevelAgent
 		switch {
+		case ev.Kind == "politica_cobranca":
+			level = domain.LevelError
 		case ev.Kind == "permissao_negada":
 			level = domain.LevelAuth
 		case ev.IsError:

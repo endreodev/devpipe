@@ -1,0 +1,2 @@
+cd C:\GIT\devpipe\DevPipe
+.\build.ps1

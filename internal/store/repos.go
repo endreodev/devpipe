@@ -97,14 +97,15 @@ func nz(v []string) []string {
 
 // ---------- Demandas ----------
 
-const demandCols = `d.id,d.ticket,d.title,d.summary,d.project_id,COALESCE(p.name,''),d.priority,d.queue_order,d.notes,d.base_branch,d.work_branch,d.worktree_path,d.provider,d.model,d.review_spec,d.stage,d.blocked_from,d.status,d.status_message,d.progress,d.attempts,d.validation_state,d.current_revision,d.last_activity,d.last_activity_at,d.elapsed_seconds,d.started_at,d.created_at,d.updated_at`
+const demandCols = `d.id,d.ticket,d.title,d.summary,d.project_id,COALESCE(p.name,''),d.priority,d.queue_order,d.notes,d.base_branch,d.work_branch,d.worktree_path,d.provider,d.model,d.review_spec,d.stage,d.blocked_from,d.status,d.status_message,d.progress,d.attempts,d.validation_state,d.current_revision,d.last_activity,d.last_activity_at,d.elapsed_seconds,d.started_at,d.created_at,d.updated_at,COALESCE(d.direct_branch,0),COALESCE(d.base_commit,'')`
 
 func scanDemand(r interface{ Scan(...any) error }) (domain.Demand, error) {
 	var d domain.Demand
-	var rs int
+	var rs, direta int
 	var la, st sql.NullTime
-	err := r.Scan(&d.ID, &d.Ticket, &d.Title, &d.Summary, &d.ProjectID, &d.ProjectName, &d.Priority, &d.QueueOrder, &d.Notes, &d.BaseBranch, &d.WorkBranch, &d.WorktreePath, &d.Provider, &d.Model, &rs, &d.Stage, &d.BlockedFrom, &d.Status, &d.StatusMessage, &d.Progress, &d.Attempts, &d.ValidationState, &d.CurrentRevision, &d.LastActivity, &la, &d.ElapsedSeconds, &st, &d.CreatedAt, &d.UpdatedAt)
+	err := r.Scan(&d.ID, &d.Ticket, &d.Title, &d.Summary, &d.ProjectID, &d.ProjectName, &d.Priority, &d.QueueOrder, &d.Notes, &d.BaseBranch, &d.WorkBranch, &d.WorktreePath, &d.Provider, &d.Model, &rs, &d.Stage, &d.BlockedFrom, &d.Status, &d.StatusMessage, &d.Progress, &d.Attempts, &d.ValidationState, &d.CurrentRevision, &d.LastActivity, &la, &d.ElapsedSeconds, &st, &d.CreatedAt, &d.UpdatedAt, &direta, &d.BaseCommit)
 	d.ReviewSpec = rs == 1
+	d.DirectBranch = direta == 1
 	if la.Valid {
 		t := la.Time
 		d.LastActivityAt = &t
@@ -193,8 +194,8 @@ func (s *Store) CreateDemand(d *domain.Demand, instructions string) (domain.Revi
 	}
 	d.Stage, d.Status, d.CurrentRevision = domain.StageBacklog, domain.StatusIdle, 1
 	d.CreatedAt, d.UpdatedAt = t, t
-	res, err := tx.Exec(`INSERT INTO demands(ticket,title,summary,project_id,priority,queue_order,notes,base_branch,provider,model,review_spec,stage,status,current_revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		d.Ticket, d.Title, d.Summary, d.ProjectID, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), d.Stage, d.Status, 1, t, t)
+	res, err := tx.Exec(`INSERT INTO demands(ticket,title,summary,project_id,priority,queue_order,notes,base_branch,provider,model,review_spec,stage,status,current_revision,created_at,updated_at,direct_branch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		d.Ticket, d.Title, d.Summary, d.ProjectID, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), d.Stage, d.Status, 1, t, t, b2i(d.DirectBranch))
 	if err != nil {
 		return domain.Revision{}, err
 	}
@@ -210,15 +211,15 @@ func (s *Store) CreateDemand(d *domain.Demand, instructions string) (domain.Revi
 
 // UpdateDemandFields atualiza campos editáveis pelo usuário.
 func (s *Store) UpdateDemandFields(d domain.Demand) error {
-	_, err := s.db.Exec(`UPDATE demands SET ticket=?,title=?,summary=?,priority=?,queue_order=?,notes=?,base_branch=?,provider=?,model=?,review_spec=?,updated_at=? WHERE id=?`,
-		d.Ticket, d.Title, d.Summary, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), now(), d.ID)
+	_, err := s.db.Exec(`UPDATE demands SET ticket=?,title=?,summary=?,priority=?,queue_order=?,notes=?,base_branch=?,provider=?,model=?,review_spec=?,direct_branch=?,updated_at=? WHERE id=?`,
+		d.Ticket, d.Title, d.Summary, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), b2i(d.DirectBranch), now(), d.ID)
 	return err
 }
 
 // UpdateDemandState persiste o estado de execução (usado pelo orquestrador).
 func (s *Store) UpdateDemandState(d domain.Demand) error {
-	_, err := s.db.Exec(`UPDATE demands SET stage=?,blocked_from=?,status=?,status_message=?,progress=?,attempts=?,validation_state=?,current_revision=?,work_branch=?,worktree_path=?,last_activity=?,last_activity_at=?,elapsed_seconds=?,started_at=?,updated_at=? WHERE id=?`,
-		d.Stage, d.BlockedFrom, d.Status, d.StatusMessage, d.Progress, d.Attempts, d.ValidationState, d.CurrentRevision, d.WorkBranch, d.WorktreePath, d.LastActivity, d.LastActivityAt, d.ElapsedSeconds, d.StartedAt, now(), d.ID)
+	_, err := s.db.Exec(`UPDATE demands SET stage=?,blocked_from=?,status=?,status_message=?,progress=?,attempts=?,validation_state=?,current_revision=?,work_branch=?,worktree_path=?,base_commit=?,last_activity=?,last_activity_at=?,elapsed_seconds=?,started_at=?,updated_at=? WHERE id=?`,
+		d.Stage, d.BlockedFrom, d.Status, d.StatusMessage, d.Progress, d.Attempts, d.ValidationState, d.CurrentRevision, d.WorkBranch, d.WorktreePath, d.BaseCommit, d.LastActivity, d.LastActivityAt, d.ElapsedSeconds, d.StartedAt, now(), d.ID)
 	return err
 }
 

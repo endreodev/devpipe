@@ -210,7 +210,7 @@ function cardHTML(d, draggable) {
   return `<article class="${cls.join(" ")}" style="--sc:${STAGE_COLOR[d.stage]}" data-open="${d.id}" data-id="${d.id}" ${draggable ? 'draggable="true"' : ""}>
     <div class="top"><span class="tk">${esc(d.ticket)}</span>${badgePrio(d.priority)}<span class="grow"></span>${badgeStatus(d)}</div>
     <div class="ttl">${esc(d.title)}</div>
-    <div class="meta"><span title="Projeto">⬡ ${esc(d.projectName)}</span><span title="Branch">⑂ ${esc(d.workBranch || d.baseBranch || "branch atual")}</span>
+    <div class="meta"><span title="Projeto">⬡ ${esc(d.projectName)}</span><span title="${d.directBranch ? "Direto na branch selecionada" : "Branch"}">⑂ ${esc(d.workBranch || d.baseBranch || "branch atual")}${d.directBranch ? " (direto)" : ""}</span>
       <span title="Tempo de execução">⏱ ${elapsed(d)}</span><span title="Tentativas">↻ ${d.attempts}</span><span title="Provedor">◎ ${esc(d.provider)}</span>${d.currentRevision > 1 ? `<span title="Revisão">rev ${d.currentRevision}</span>` : ""}</div>
     ${d.validationState ? `<div style="margin-top:6px">${badgeValid(d.validationState)}</div>` : ""}
     ${segbar(d)}
@@ -423,11 +423,22 @@ async function demandForm(det) {
     } catch (e) { box.innerHTML = `<div class="callout bad">⚠ ${esc(e.message)}</div>`; return; }
     const locked = editing && d.workBranch;
     const sel = d.baseBranch || "";
+    const direct = editing ? !!d.directBranch : (localStorage.getItem("devpipe.directBranch") ?? "1") === "1";
     box.innerHTML = `<label class="f"><span>Branch base para desenvolver</span>
       <div class="chips" style="margin-bottom:8px"><span class="chip ${sel === "" ? "on" : ""}" data-branch="">● Atual (${esc(current || "?")})</span>${opts.map((o) => `<span class="chip ${sel === o ? "on" : ""}" data-branch="${esc(o)}">${esc(o)}</span>`).join("")}</div>
       <select name="baseBranch" ${locked ? "disabled" : ""}><option value="">Branch atualmente selecionada (${esc(current || "?")})</option>${branches.map((b) => `<option value="${esc(b.name)}" ${sel === b.name ? "selected" : ""}>${esc(b.name)}${b.current ? "  (atual)" : ""}${b.remote ? "  [remota]" : ""}</option>`).join("")}</select>
-      <div class="help">${locked ? "Bloqueada: a branch de trabalho " + esc(d.workBranch) + " já foi criada." : "A IA trabalha em uma branch nova e isolada criada a partir desta. Seu checkout atual não é alterado."}</div></label>
+      <div class="help" id="branch-help"></div></label>
+      <label class="check"><input type="checkbox" name="directBranch" ${direct ? "checked" : ""} ${locked ? "disabled" : ""}><span>Fazer os ajustes direto nesta branch (não criar branch nova)<br><span class="help">Os commits da demanda são aplicados na própria branch selecionada (somente fast-forward, sem push).</span></span></label>
       ${info.dirty ? `<div class="callout warn small">⚠ O checkout principal tem ${info.dirty} alteração(ões) não commitada(s). Elas não serão tocadas nem incluídas.</div>` : ""}`;
+    const helpBranch = () => {
+      const on = form.directBranch?.checked;
+      $("#branch-help").textContent = locked
+        ? (d.directBranch ? "Bloqueada: a demanda já está trabalhando direto na branch " + d.workBranch + "." : "Bloqueada: a branch de trabalho " + d.workBranch + " já foi criada.")
+        : on ? "A IA edita numa área de trabalho separada e, a cada commit, aplica as alterações nesta mesma branch. Nenhuma branch nova é criada."
+             : "A IA trabalha em uma branch nova e isolada criada a partir desta. Seu checkout atual não é alterado.";
+    };
+    form.directBranch?.addEventListener("change", () => { localStorage.setItem("devpipe.directBranch", form.directBranch.checked ? "1" : "0"); helpBranch(); });
+    helpBranch();
     if (!locked) $$("[data-branch]", box).forEach((c) => c.addEventListener("click", () => { form.baseBranch.value = c.dataset.branch; $$("[data-branch]", box).forEach((x) => x.classList.toggle("on", x === c)); }));
     form.baseBranch?.addEventListener("change", () => $$("[data-branch]", box).forEach((x) => x.classList.toggle("on", x.dataset.branch === form.baseBranch.value)));
   }
@@ -447,6 +458,7 @@ async function demandForm(det) {
       ticket: form.ticket.value.trim(), title: form.title.value.trim(), summary: form.summary.value, priority: +form.priority.value,
       queueOrder: +form.queueOrder.value || 0, notes: form.notes.value, provider: form.provider.value, model: form.model.value.trim(),
       reviewSpec: form.reviewSpec.checked, baseBranch: form.baseBranch ? form.baseBranch.value : d.baseBranch || "", instructions: form.instructions.value,
+      directBranch: form.directBranch ? form.directBranch.checked : !!d.directBranch,
     };
     $$("button", form).forEach((b) => (b.disabled = true));
     try {
@@ -493,7 +505,7 @@ VIEWS.demanda = async (r, soft) => {
     body = `<div class="grid g2">
       <div class="panel"><h2>Dados da missão</h2><dl class="kv">
         <dt>Projeto</dt><dd>${esc(d.projectName)}</dd><dt>Branch base</dt><dd class="mono">${esc(d.baseBranch || "branch atual (definida ao iniciar)")}</dd>
-        <dt>Branch de trabalho</dt><dd class="mono">${esc(d.workBranch || "— (criada na Preparação)")}</dd><dt>Worktree</dt><dd class="mono small">${esc(d.worktreePath || "—")}</dd>
+        <dt>Branch de trabalho</dt><dd class="mono">${esc(d.workBranch || (d.directBranch ? "— (a própria branch selecionada)" : "— (criada na Preparação)"))}${d.directBranch ? " · direto na branch" : ""}</dd><dt>Worktree</dt><dd class="mono small">${esc(d.worktreePath || "—")}</dd>
         <dt>Provedor</dt><dd>${esc(d.provider)}${d.model ? " · " + esc(d.model) : ""}</dd><dt>Prioridade</dt><dd>${badgePrio(d.priority)} · ordem ${d.queueOrder}</dd>
         <dt>Revisão atual</dt><dd>${d.currentRevision}</dd><dt>Tentativas</dt><dd>${d.attempts}</dd><dt>Tempo de execução</dt><dd>${elapsed(d)}</dd>
         <dt>Validação</dt><dd>${badgeValid(d.validationState) || "—"}</dd><dt>Criada em</dt><dd>${fmtDate(d.createdAt)}</dd>
@@ -806,6 +818,9 @@ VIEWS.config = async () => {
       <label class="f"><span>Tentativas automáticas de correção após falha de validação</span><input type="number" min="0" max="5" name="maxFix" value="${s.maxFixAttempts}"></label>
       <label class="f"><span>Tempo limite por chamada do agente (minutos)</span><input type="number" min="5" name="agentTO" value="${s.agentTimeoutMin}"></label>
       <label class="f"><span>Tempo limite por comando de build/teste (minutos)</span><input type="number" min="1" name="cmdTO" value="${s.commandTimeoutMin}"></label>
+      <h3 style="margin-top:16px">Autor dos commits automáticos</h3>
+      <label class="f"><span>Nome</span><input type="text" name="cName" value="${esc(s.commitAuthorName || "")}" placeholder="vazio = user.name do Git do repositório"></label>
+      <label class="f"><span>E-mail</span><input type="text" name="cEmail" value="${esc(s.commitAuthorEmail || "")}" placeholder="vazio = user.email do Git do repositório"><div class="help">Use o mesmo usuário do Azure DevOps para que os commits apareçam com seu avatar e contem nos relatórios. Gravado somente nesta máquina (não vai para o código nem para o Git).</div></label>
     </div>
     <div class="panel hud"><h2>Segurança</h2>
       <label class="f"><span>Diretórios autorizados (um por linha)</span><textarea name="roots" class="mono" placeholder="C:\\repos">${esc((s.authorizedRoots || []).join("\n"))}</textarea><div class="help">Projetos fora destes diretórios são recusados. Vazio = qualquer repositório cadastrado (não recomendado).</div></label>
@@ -824,7 +839,7 @@ VIEWS.config = async () => {
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const st = { ...S.settings, maxParallel: +f.maxParallel.value || 1, maxFixAttempts: +f.maxFix.value, agentTimeoutMin: +f.agentTO.value || 45, commandTimeoutMin: +f.cmdTO.value || 15,
-      authorizedRoots: f.roots.value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) };
+      authorizedRoots: f.roots.value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean), commitAuthorName: f.cName.value.trim(), commitAuthorEmail: f.cEmail.value.trim() };
     S.settings = await guarded(() => api("PUT", "/api/settings", st), "Configurações salvas");
   });
 };

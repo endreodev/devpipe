@@ -48,6 +48,8 @@ Por que não as outras: **C#** seria a segunda melhor opção (especialmente se 
 5. **Desenvolvimento** — o agente edita arquivos na worktree com ferramentas restritas.
 6. **Validação** — a aplicação executa os comandos oficiais de build/teste. Se falhar, pede correção ao agente (retomando a mesma sessão) até N vezes. Se não houver comandos, registra explicitamente "validação não executada".
 7. **Revisão** — commit local na branch de trabalho (opcional), diff disponível, aguarda humano.
+
+> **Modo "direto na branch selecionada"** (opção da demanda, padrão a partir da v0.2.2): nenhuma branch nova é criada. A Preparação cria a área de trabalho em **HEAD destacado** na ponta da branch escolhida (a branch não fica presa — o seu checkout continua podendo usá-la), guarda o commit inicial (`base_commit`, base do diff) e, a cada commit da demanda, avança a própria branch **somente por fast-forward**: se ela estiver em checkout (ex.: aberta no VS Code), roda `git merge --ff-only` naquele diretório (o Git recusa se houver alterações locais conflitantes); senão, `git update-ref` com verificação do valor antigo. Se a branch tiver recebido outros commits no meio, nada é forçado: o commit fica preservado na área de trabalho e o log mostra o comando para aplicar. Branch remota escolhida (ex.: `origin/release`) vira a branch local de acompanhamento de mesmo nome. Sem push.
 8. **Concluir** ou **Devolver para ajustes** — a devolução cria a revisão nº N com novas instruções/anexos; a nova análise recebe as especificações anteriores, o resumo da última implementação e o diff existente, e planeja **somente os ajustes**.
 
 ### Progresso

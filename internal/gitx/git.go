@@ -248,6 +248,12 @@ func (r Repo) ChangedFiles() []string {
 	return files
 }
 
+// Autor dos commits automáticos (configurável em Configuração e segurança,
+// gravado apenas no banco local). Vazio = usa user.name/user.email do Git do
+// repositório. Nenhuma identidade fica fixa no código.
+var CommitAuthorName = ""
+var CommitAuthorEmail = ""
+
 // CommitAll faz commit local de tudo na worktree da demanda (sem push).
 func (r Repo) CommitAll(msg string) (string, error) {
 	files := r.ChangedFiles()
@@ -257,7 +263,22 @@ func (r Repo) CommitAll(msg string) (string, error) {
 	if _, err := r.git("add", "-A"); err != nil {
 		return "", err
 	}
-	if _, err := r.git("-c", "user.name=DevPipe AI", "-c", "user.email=devpipe@localhost", "commit", "--no-verify", "-m", msg); err != nil {
+	name, email := strings.TrimSpace(CommitAuthorName), strings.TrimSpace(CommitAuthorEmail)
+	if email == "" {
+		email, _ = r.git("config", "user.email")
+	}
+	if name == "" {
+		name, _ = r.git("config", "user.name")
+	}
+	args := []string{}
+	if name != "" {
+		args = append(args, "-c", "user.name="+name)
+	}
+	if email != "" {
+		args = append(args, "-c", "user.email="+email)
+	}
+	args = append(args, "commit", "--no-verify", "-m", msg)
+	if _, err := r.git(args...); err != nil {
 		return "", err
 	}
 	return r.HeadSHA(), nil
@@ -412,4 +433,110 @@ func splitZ(b []byte) []string {
 		}
 	}
 	return out
+}
+
+// ---------- trabalho direto na branch selecionada ----------
+
+// BranchTip devolve o SHA da ponta de uma branch local.
+func (r Repo) BranchTip(branch string) (string, error) {
+	return r.git("rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
+}
+
+// IsAncestor indica se a é ancestral de (ou igual a) b.
+func (r Repo) IsAncestor(a, b string) bool {
+	_, err := r.git("merge-base", "--is-ancestor", a, b)
+	return err == nil
+}
+
+// ResolveLocalBranch converte a branch escolhida na tela em uma branch local.
+// Se for remota (ex.: origin/release) e não existir localmente, cria a branch
+// local de acompanhamento com o mesmo nome (release) — sem criar nome novo.
+func (r Repo) ResolveLocalBranch(name string) (local string, created bool, err error) {
+	if r.LocalBranchExists(name) {
+		return name, false, nil
+	}
+	if r.RefExists("refs/remotes/" + name) {
+		if i := strings.Index(name, "/"); i > 0 {
+			local = name[i+1:]
+			if r.LocalBranchExists(local) {
+				return local, false, nil
+			}
+			if _, err := r.git("branch", "--track", local, "refs/remotes/"+name); err != nil {
+				return "", false, err
+			}
+			return local, true, nil
+		}
+	}
+	return "", false, fmt.Errorf("branch %q não encontrada no repositório", name)
+}
+
+// WorktreeOfBranch devolve o diretório onde a branch está em checkout
+// (checkout principal ou outra worktree), ou "" se não estiver.
+func (r Repo) WorktreeOfBranch(branch string) string {
+	out, err := r.git("worktree", "list", "--porcelain")
+	if err != nil {
+		return ""
+	}
+	dir := ""
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "worktree ") {
+			dir = strings.TrimPrefix(l, "worktree ")
+		} else if l == "branch refs/heads/"+branch {
+			return filepath.FromSlash(dir)
+		}
+	}
+	return ""
+}
+
+// EnsureDetachedWorktree cria (ou reaproveita) uma worktree em HEAD destacado
+// no commit informado. Ela não "prende" a branch: o checkout principal continua
+// podendo usar a mesma branch normalmente.
+func (r Repo) EnsureDetachedWorktree(wtPath, commit string) (created bool, err error) {
+	if st, e := os.Stat(wtPath); e == nil && st.IsDir() {
+		if _, e := (Repo{Dir: wtPath}).git("rev-parse", "HEAD"); e != nil {
+			return false, fmt.Errorf("a worktree existente em %s está inválida: %v", wtPath, e)
+		}
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(wtPath), 0o755); err != nil {
+		return false, err
+	}
+	r.git("worktree", "prune")
+	_, err = r.git("worktree", "add", "--detach", wtPath, commit)
+	return err == nil, err
+}
+
+// PublishToBranch avança a branch até newSHA somente por fast-forward
+// (nunca reescreve histórico nem descarta commits de outras pessoas).
+// Se a branch estiver em checkout (por exemplo, aberta no VS Code), faz
+// "git merge --ff-only" naquele diretório para atualizar também os arquivos;
+// o Git recusa se houver alterações locais conflitantes.
+func (r Repo) PublishToBranch(branch, newSHA string) (onde string, err error) {
+	tip, err := r.BranchTip(branch)
+	if err != nil {
+		return "", err
+	}
+	if tip == newSHA {
+		return "a branch já estava neste commit", nil
+	}
+	if !r.IsAncestor(tip, newSHA) {
+		return "", fmt.Errorf("a branch %s recebeu outros commits depois do início da demanda (não é possível avançar por fast-forward)", branch)
+	}
+	if dir := r.WorktreeOfBranch(branch); dir != "" {
+		if _, err := (Repo{Dir: dir}).git("merge", "--ff-only", "--no-edit", newSHA); err != nil {
+			return "", fmt.Errorf("não foi possível atualizar o checkout %s (há alterações locais nos mesmos arquivos?): %v", dir, err)
+		}
+		return "checkout " + dir + " atualizado (fast-forward)", nil
+	}
+	if _, err := r.git("update-ref", "-m", "DevPipe: fast-forward", "refs/heads/"+branch, newSHA, tip); err != nil {
+		return "", err
+	}
+	return "branch atualizada (fast-forward)", nil
+}
+
+// DetachTo move uma worktree destacada para outro commit (somente se limpa).
+func (r Repo) DetachTo(commit string) error {
+	_, err := r.git("checkout", "--detach", commit)
+	return err
 }

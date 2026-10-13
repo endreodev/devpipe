@@ -168,6 +168,8 @@ var migrations = []string{
 	);
 	CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
 	`ALTER TABLE projects ADD COLUMN file_encoding TEXT DEFAULT 'auto';`,
+	`ALTER TABLE demands ADD COLUMN direct_branch INTEGER DEFAULT 0;`,
+	`ALTER TABLE demands ADD COLUMN base_commit TEXT DEFAULT '';`,
 }
 
 func (s *Store) migrate() error {

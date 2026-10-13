@@ -90,6 +90,9 @@ func (e *Engine) ApproveReview(id int64, note string) error {
 	}
 	d.Stage, d.Status, d.Progress = domain.StageDone, domain.StatusDone, 100
 	d.StatusMessage = "Aprovada na revisão humana. Branch " + d.WorkBranch + " pronta para merge manual."
+	if d.DirectBranch {
+		d.StatusMessage = "Aprovada na revisão humana. Alterações aplicadas na branch " + d.WorkBranch + " (commit local, sem push)."
+	}
 	e.touch(&d, "Revisão aprovada")
 	e.save(&d)
 	e.log(d, 0, domain.LevelOK, "concluido", "Demanda concluída — aprovada na revisão humana. Merge/push não são automáticos.", note)

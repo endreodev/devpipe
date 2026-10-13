@@ -407,7 +407,7 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		}
 		pc.PrevSummary = e.lastSummary(d.ID)
 		if wtExists && d.BaseBranch != "" {
-			pc.DiffStat = gitx.Repo{Dir: wt}.DiffStat(d.BaseBranch)
+			pc.DiffStat = gitx.Repo{Dir: wt}.DiffStat(d.DiffBase())
 		}
 	}
 	attDirs := []string{filepath.Join(e.dataDir, "anexos", fmt.Sprint(d.ID))}
@@ -484,7 +484,7 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	repo := gitx.Repo{Dir: wt}
 	pc.D = d
 	if rev.Number > 1 && pc.DiffStat == "" {
-		pc.DiffStat = repo.DiffStat(d.BaseBranch)
+		pc.DiffStat = repo.DiffStat(d.DiffBase())
 	}
 	if ctx.Err() != nil {
 		fail(domain.StagePrep, ctx.Err())
@@ -605,15 +605,15 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	default:
 		d.ValidationState = "falhou"
 		e.commitIfConfigured(rs, p, repo, rev)
-		run.DiffStat = repo.DiffStat(d.BaseBranch)
+		run.DiffStat = repo.DiffStat(d.DiffBase())
 		e.st.UpdateRun(*run)
-		fail(domain.StageValidation, errors.New("a validação continua falhando após as tentativas de correção; o trabalho foi preservado na branch "+d.WorkBranch+" para análise humana"))
+		fail(domain.StageValidation, errors.New("a validação continua falhando após as tentativas de correção; o trabalho foi preservado em "+wt+" (branch "+d.WorkBranch+") para análise humana"))
 		return
 	}
 
 	// --- REVISÃO
 	e.commitIfConfigured(rs, p, repo, rev)
-	run.DiffStat = repo.DiffStat(d.BaseBranch)
+	run.DiffStat = repo.DiffStat(d.DiffBase())
 	t := time.Now().UTC()
 	run.Status, run.FinishedAt = domain.StatusDone, &t
 	e.st.UpdateRun(*run)
@@ -684,7 +684,7 @@ func (e *Engine) encRestore(rs *runState, p domain.Project, wt string, m *encx.M
 		}()
 	}
 	repo := gitx.Repo{Dir: wt}
-	rep := encx.Restore(wt, repo.MergeBase(rs.d.BaseBranch), m, p.FileEncoding)
+	rep := encx.Restore(wt, repo.MergeBase(rs.d.DiffBase()), m, p.FileEncoding)
 	rs.encIssues = rep.Issues
 	if m != nil && len(m.Converted) > 0 {
 		e.log(*rs.d, rs.run.ID, domain.LevelOK, "codificacao", fmt.Sprintf("Codificação protegida: %d arquivo(s) Windows-1252 usados pela IA foram devolvidos à codificação original (%s)", len(m.Converted), time.Since(start).Round(100*time.Millisecond)), strings.Join(keys(m.Converted), "\n"))
@@ -736,7 +736,7 @@ func (e *Engine) RepairEncoding(id int64) (encx.Report, error) {
 		return encx.Report{}, err
 	}
 	repo := gitx.Repo{Dir: d.WorktreePath}
-	rep := encx.Restore(d.WorktreePath, repo.MergeBase(d.BaseBranch), nil, p.FileEncoding)
+	rep := encx.Restore(d.WorktreePath, repo.MergeBase(d.DiffBase()), nil, p.FileEncoding)
 	msg := fmt.Sprintf("Reparo de codificação: %d arquivo(s) regravados, %d com acentuação recuperada, %d problema(s) restantes", len(rep.Restored), len(rep.Repaired), len(rep.Issues))
 	var det strings.Builder
 	for _, is := range rep.Issues {
@@ -750,6 +750,7 @@ func (e *Engine) RepairEncoding(id int64) (encx.Report, error) {
 	if p.AutoCommit && len(repo.ChangedFiles()) > 0 {
 		if sha, err := repo.CommitAll(d.Ticket + ": correção de codificação de caracteres (DevPipe)"); err == nil && sha != "" {
 			e.log(d, 0, domain.LevelOK, "git", "Commit local de reparo criado ("+sha[:min(10, len(sha))]+")", "")
+			e.publish(d, 0, sha)
 		}
 	}
 	return rep, nil
@@ -769,7 +770,12 @@ func (e *Engine) commitIfConfigured(rs *runState, p domain.Project, repo gitx.Re
 	}
 	if sha != "" {
 		rs.run.CommitSHA = sha
-		e.log(*d, rs.run.ID, domain.LevelOK, "git", "Commit local criado na branch "+d.WorkBranch+" ("+sha[:min(10, len(sha))]+") — nenhum push realizado", "")
+		if d.DirectBranch {
+			e.log(*d, rs.run.ID, domain.LevelOK, "git", "Commit local criado ("+sha[:min(10, len(sha))]+")", "")
+			e.publish(*d, rs.run.ID, sha)
+		} else {
+			e.log(*d, rs.run.ID, domain.LevelOK, "git", "Commit local criado na branch "+d.WorkBranch+" ("+sha[:min(10, len(sha))]+") — nenhum push realizado", "")
+		}
 	}
 }
 
@@ -798,6 +804,9 @@ func (e *Engine) prepareGit(rs *runState, p domain.Project, wt string) error {
 	if dirty, err := main.StatusPorcelain(); err == nil && len(dirty) > 0 {
 		e.log(*d, rs.run.ID, domain.LevelWarn, "git", fmt.Sprintf("O checkout principal possui %d alteração(ões) não commitada(s). Elas NÃO serão tocadas nem incluídas: a demanda usa uma worktree isolada.", len(dirty)), strings.Join(dirty, "\n"))
 	}
+	if d.DirectBranch {
+		return e.prepareDirect(rs, main, wt)
+	}
 	if d.WorkBranch == "" {
 		name := gitx.SafeBranchName(p.BranchPrefix, d.Ticket, d.Title)
 		if main.LocalBranchExists(name) {
@@ -820,6 +829,73 @@ func (e *Engine) prepareGit(rs *runState, p domain.Project, wt string) error {
 		}
 	}
 	return nil
+}
+
+// prepareDirect: a demanda trabalha na própria branch selecionada, sem criar
+// branch nova. O agente edita numa worktree em HEAD destacado (o seu checkout
+// não é tocado durante a execução) e cada commit é aplicado na branch por
+// fast-forward (ver publish).
+func (e *Engine) prepareDirect(rs *runState, main gitx.Repo, wt string) error {
+	d := rs.d
+	if d.WorkBranch == "" {
+		local, criada, err := main.ResolveLocalBranch(d.BaseBranch)
+		if err != nil {
+			return err
+		}
+		if criada {
+			e.log(*d, rs.run.ID, domain.LevelInfo, "git", "Branch local "+local+" criada acompanhando "+d.BaseBranch, "")
+		}
+		d.WorkBranch = local
+	}
+	tip, err := main.BranchTip(d.WorkBranch)
+	if err != nil {
+		return fmt.Errorf("branch %q não encontrada: %v", d.WorkBranch, err)
+	}
+	created, err := main.EnsureDetachedWorktree(wt, tip)
+	if err != nil {
+		return err
+	}
+	if d.BaseCommit == "" {
+		d.BaseCommit = tip
+	}
+	d.WorktreePath = wt
+	e.save(d)
+	if created {
+		e.log(*d, rs.run.ID, domain.LevelOK, "git", fmt.Sprintf("Trabalhando direto na branch %s (nenhuma branch nova criada). Commit inicial %s.", d.WorkBranch, tip[:min(10, len(tip))]), wt)
+		return nil
+	}
+	repo := gitx.Repo{Dir: wt}
+	head := repo.HeadSHA()
+	switch {
+	case head == tip:
+	case len(repo.ChangedFiles()) == 0 && main.IsAncestor(head, tip):
+		// a branch avançou (ex.: commits seus ou da revisão anterior): acompanha a ponta
+		if err := repo.DetachTo(tip); err != nil {
+			return err
+		}
+		e.log(*d, rs.run.ID, domain.LevelInfo, "git", "Área de trabalho atualizada para a ponta atual da branch "+d.WorkBranch, "")
+	default:
+		e.log(*d, rs.run.ID, domain.LevelWarn, "git", "A área de trabalho da demanda tem alterações/commits que ainda não estão na branch "+d.WorkBranch+"; serão preservados", strings.Join(repo.ChangedFiles(), "\n"))
+	}
+	return nil
+}
+
+// publish aplica o commit da demanda na branch selecionada (modo direto).
+func (e *Engine) publish(d domain.Demand, runID int64, sha string) {
+	if !d.DirectBranch || sha == "" {
+		return
+	}
+	p, err := e.st.GetProject(d.ProjectID)
+	if err != nil {
+		return
+	}
+	onde, err := (gitx.Repo{Dir: p.Path}).PublishToBranch(d.WorkBranch, sha)
+	if err != nil {
+		e.log(d, runID, domain.LevelWarn, "git", "O commit "+sha[:min(10, len(sha))]+" NÃO foi aplicado na branch "+d.WorkBranch+": "+err.Error(),
+			"O trabalho está preservado em "+d.WorktreePath+".\nPara aplicar manualmente no seu checkout: git merge --ff-only "+sha+"\n(ou git cherry-pick "+sha+" se a branch tiver avançado)")
+		return
+	}
+	e.log(d, runID, domain.LevelOK, "git", "Commit "+sha[:min(10, len(sha))]+" aplicado na branch "+d.WorkBranch+" — "+onde+" — nenhum push realizado", "")
 }
 
 // validate executa os comandos oficiais de build e teste do projeto.

@@ -72,17 +72,21 @@ type Project struct {
 }
 
 type Demand struct {
-	ID              int64      `json:"id"`
-	Ticket          string     `json:"ticket"`
-	Title           string     `json:"title"`
-	Summary         string     `json:"summary"`
-	ProjectID       int64      `json:"projectId"`
-	ProjectName     string     `json:"projectName,omitempty"`
-	Priority        int        `json:"priority"` // 1=crítica .. 4=baixa
-	QueueOrder      int        `json:"queueOrder"`
-	Notes           string     `json:"notes"`
-	BaseBranch      string     `json:"baseBranch"` // "" = branch atual do repositório
-	WorkBranch      string     `json:"workBranch"`
+	ID          int64  `json:"id"`
+	Ticket      string `json:"ticket"`
+	Title       string `json:"title"`
+	Summary     string `json:"summary"`
+	ProjectID   int64  `json:"projectId"`
+	ProjectName string `json:"projectName,omitempty"`
+	Priority    int    `json:"priority"` // 1=crítica .. 4=baixa
+	QueueOrder  int    `json:"queueOrder"`
+	Notes       string `json:"notes"`
+	BaseBranch  string `json:"baseBranch"` // "" = branch atual do repositório
+	WorkBranch  string `json:"workBranch"`
+	// DirectBranch: trabalhar direto na branch selecionada, sem criar branch nova.
+	// Os commits da demanda são aplicados (fast-forward) na própria branch.
+	DirectBranch    bool       `json:"directBranch"`
+	BaseCommit      string     `json:"baseCommit"` // commit da branch no início da demanda (base do diff)
 	WorktreePath    string     `json:"worktreePath"`
 	Provider        string     `json:"provider"`
 	Model           string     `json:"model"`
@@ -104,6 +108,14 @@ type Demand struct {
 }
 
 // Revision guarda a solicitação original (nº 1) e cada devolução para ajustes.
+// DiffBase devolve a referência usada para comparar o trabalho da demanda.
+func (d Demand) DiffBase() string {
+	if d.DirectBranch && d.BaseCommit != "" {
+		return d.BaseCommit
+	}
+	return d.BaseBranch
+}
+
 type Revision struct {
 	ID           int64     `json:"id"`
 	DemandID     int64     `json:"demandId"`
@@ -198,6 +210,8 @@ type Settings struct {
 	CommandTimeoutMin int             `json:"commandTimeoutMin"`
 	AgentTimeoutMin   int             `json:"agentTimeoutMin"`
 	AutoStartQueue    bool            `json:"autoStartQueue"`
+	CommitAuthorName  string          `json:"commitAuthorName"`  // autor dos commits automáticos (vazio = user.name do Git)
+	CommitAuthorEmail string          `json:"commitAuthorEmail"` // vazio = user.email do Git do repositório
 	Claude            ClaudeSettings  `json:"claude"`
 	Generic           GenericSettings `json:"generic"`
 }

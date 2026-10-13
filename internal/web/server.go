@@ -35,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.2.0"
+const Version = "0.2.2"
 
 type Server struct {
 	st      *store.Store
@@ -52,6 +52,7 @@ func New(st *store.Store, eng *pipeline.Engine, reg *provider.Registry, dataDir 
 
 // ConfigureProviders (re)registra provedores a partir das configurações.
 func ConfigureProviders(reg *provider.Registry, s domain.Settings) {
+	gitx.CommitAuthorName, gitx.CommitAuthorEmail = s.CommitAuthorName, s.CommitAuthorEmail
 	reg.Remove("claude")
 	reg.Remove("generico")
 	if s.Claude.Enabled {
@@ -544,6 +545,9 @@ func (s *Server) updateDemand(w http.ResponseWriter, r *http.Request) (any, erro
 	if cur.WorkBranch != "" && d.BaseBranch != cur.BaseBranch {
 		return nil, errors.New("a branch base não pode ser alterada após a criação da branch de trabalho")
 	}
+	if cur.WorkBranch != "" && d.DirectBranch != cur.DirectBranch {
+		return nil, errors.New("o modo de branch (direto na branch selecionada ou branch própria) não pode ser alterado depois que a demanda começou")
+	}
 	if err := s.st.UpdateDemandFields(d); err != nil {
 		return nil, err
 	}
@@ -571,7 +575,9 @@ func (s *Server) deleteDemand(w http.ResponseWriter, r *http.Request) (any, erro
 		return nil, err
 	}
 	msg := "Demanda " + d.Ticket + " excluída do cadastro."
-	if d.WorktreePath != "" {
+	if d.WorktreePath != "" && d.DirectBranch {
+		msg += " A área de trabalho " + d.WorktreePath + " foi preservada (remova com git worktree remove se desejar); a branch " + d.WorkBranch + " não foi tocada."
+	} else if d.WorktreePath != "" {
 		msg += " A branch " + d.WorkBranch + " e a worktree " + d.WorktreePath + " foram preservadas (remova manualmente se desejar)."
 	}
 	s.eng.SystemLog(domain.LevelWarn, "exclusao", msg)
@@ -661,14 +667,14 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d.WorktreePath == "" || d.BaseBranch == "" {
+	if d.WorktreePath == "" || d.DiffBase() == "" {
 		return map[string]string{"diff": "", "stat": "", "message": "A branch de trabalho ainda não foi criada."}, nil
 	}
 	if _, err := os.Stat(d.WorktreePath); err != nil {
 		return map[string]string{"diff": "", "message": "Worktree não encontrada: " + d.WorktreePath}, nil
 	}
 	repo := gitx.Repo{Dir: d.WorktreePath}
-	return map[string]string{"diff": security.Redact(displayText(repo.Diff(d.BaseBranch, 400<<10))), "stat": repo.DiffStat(d.BaseBranch),
+	return map[string]string{"diff": security.Redact(displayText(repo.Diff(d.DiffBase(), 400<<10))), "stat": repo.DiffStat(d.DiffBase()),
 		"branch": d.WorkBranch, "base": d.BaseBranch, "worktree": d.WorktreePath}, nil
 }
 
@@ -815,6 +821,10 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) (any, erro
 	}
 	if st.Claude.PermissionMode == "bypassPermissions" {
 		return nil, errors.New("o modo bypassPermissions não é permitido na esteira")
+	}
+	st.CommitAuthorName, st.CommitAuthorEmail = strings.TrimSpace(st.CommitAuthorName), strings.TrimSpace(st.CommitAuthorEmail)
+	if strings.ContainsAny(st.CommitAuthorName+st.CommitAuthorEmail, "<>\n\r") || (st.CommitAuthorEmail != "" && !strings.Contains(st.CommitAuthorEmail, "@")) {
+		return nil, errors.New("nome ou e-mail do autor dos commits inválido")
 	}
 	clean := st.AuthorizedRoots[:0]
 	for _, root := range st.AuthorizedRoots {

@@ -540,3 +540,40 @@ func (r Repo) DetachTo(commit string) error {
 	_, err := r.git("checkout", "--detach", commit)
 	return err
 }
+
+// PatchSince devolve o patch (binário) de tudo o que mudou na worktree desde
+// base: commits da demanda + alterações ainda não commitadas + arquivos novos.
+func (r Repo) PatchSince(base string) ([]byte, error) {
+	if _, err := r.git("add", "-A"); err != nil { // índice da worktree da demanda (não do usuário)
+		return nil, err
+	}
+	return r.gitRaw("diff", "--cached", "--binary", "--full-index", base)
+}
+
+// PatchFiles lista os arquivos tocados pelo patch.
+func (r Repo) PatchFiles(base string) []string {
+	out, err := r.git("diff", "--cached", "--name-only", base)
+	if err != nil || out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+func (r Repo) applyFile(patchPath string, extra ...string) error {
+	args := append([]string{"apply", "--binary", "--whitespace=nowarn"}, extra...)
+	_, err := r.git(append(args, patchPath)...)
+	return err
+}
+
+// ApplyPatchToWorkingTree aplica o patch nos arquivos do checkout como
+// alterações pendentes (não faz commit, não mexe no índice). Antes confere
+// se aplica sem conflito; se o patch já estiver aplicado, não faz nada.
+func (r Repo) ApplyPatchToWorkingTree(patchPath string) (jaAplicado bool, err error) {
+	if r.applyFile(patchPath, "--check") == nil {
+		return false, r.applyFile(patchPath)
+	}
+	if r.applyFile(patchPath, "--reverse", "--check") == nil {
+		return true, nil
+	}
+	return false, r.applyFile(patchPath, "--check")
+}

@@ -88,10 +88,17 @@ func (e *Engine) ApproveReview(id int64, note string) error {
 	if d.Stage != domain.StageReview {
 		return errors.New("somente demandas em Revisão podem ser aprovadas")
 	}
+	aplicado := ""
+	if d.DirectBranch {
+		// leva as alterações para a branch selecionada; se falhar, continua em Revisão
+		if aplicado, err = e.ApplyToBranch(id); err != nil {
+			return err
+		}
+	}
 	d.Stage, d.Status, d.Progress = domain.StageDone, domain.StatusDone, 100
 	d.StatusMessage = "Aprovada na revisão humana. Branch " + d.WorkBranch + " pronta para merge manual."
 	if d.DirectBranch {
-		d.StatusMessage = "Aprovada na revisão humana. Alterações aplicadas na branch " + d.WorkBranch + " (commit local, sem push)."
+		d.StatusMessage = "Aprovada. " + aplicado
 	}
 	e.touch(&d, "Revisão aprovada")
 	e.save(&d)

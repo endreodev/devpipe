@@ -35,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.2.2"
+const Version = "0.2.3"
 
 type Server struct {
 	st      *store.Store
@@ -108,6 +108,7 @@ func (s *Server) Handler() http.Handler {
 	h("POST /api/demands/{id}/cancel", func(w http.ResponseWriter, r *http.Request) (any, error) { return nil, s.eng.Cancel(pid(r)) })
 	h("POST /api/demands/{id}/approve-spec", s.approveSpec)
 	h("POST /api/demands/{id}/approve-review", s.approveReview)
+	h("POST /api/demands/{id}/apply-branch", s.applyBranch)
 	h("POST /api/demands/{id}/adjust", s.adjust)
 	h("POST /api/demands/{id}/move", s.move)
 	h("GET /api/demands/{id}/diff", s.diff)
@@ -636,6 +637,14 @@ func (s *Server) approveReview(w http.ResponseWriter, r *http.Request) (any, err
 	var in struct{ Note string }
 	decode(r, &in)
 	return nil, s.eng.ApproveReview(pid(r), in.Note)
+}
+
+func (s *Server) applyBranch(w http.ResponseWriter, r *http.Request) (any, error) {
+	msg, err := s.eng.ApplyToBranch(pid(r))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"message": msg}, nil
 }
 
 func (s *Server) adjust(w http.ResponseWriter, r *http.Request) (any, error) {

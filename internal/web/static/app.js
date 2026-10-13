@@ -494,7 +494,8 @@ VIEWS.demanda = async (r, soft) => {
   if (canQueue) actions.push(`<button class="btn primary" data-act="enqueue" data-id="${d.id}">▶ ${d.stage === "bloqueado" ? "Retomar" : "Executar"}</button>`);
   if (d.status === "executando" || d.status === "na_fila") actions.push(`<button class="btn bad" data-act="cancel" data-id="${d.id}">■ ${d.status === "na_fila" ? "Tirar da fila" : "Cancelar execução"}</button>`);
   if (d.stage === "planejamento" && d.status === "aguardando_aprovacao") actions.push(`<a class="btn warn" href="#/demandas/${d.id}/especificacao">⚑ Revisar especificação</a>`);
-  if (d.stage === "revisao") actions.push(`<button class="btn good" data-act="approve-review" data-id="${d.id}">✔ Aprovar e concluir</button>`);
+  if (d.stage === "revisao") actions.push(`<button class="btn good" data-act="approve-review" data-id="${d.id}">✔ Aprovar e concluir${d.directBranch ? " (aplica na branch)" : ""}</button>`);
+  if (d.directBranch && d.baseCommit && ["revisao", "concluido"].includes(d.stage) && !["executando", "na_fila"].includes(d.status)) actions.push(`<button class="btn" data-act="apply-branch" data-id="${d.id}" title="Aplica as alterações da demanda nos arquivos da branch ${esc(d.workBranch)} como alterações pendentes">⤓ Aplicar na branch</button>`);
   if (!["backlog"].includes(d.stage) && !["executando", "na_fila"].includes(d.status)) actions.push(`<button class="btn warn" data-act="adjust" data-id="${d.id}">↺ Devolver para ajustes</button>`);
   if (!["executando", "na_fila"].includes(d.status)) actions.push(`<a class="btn ghost" href="#/demandas/${d.id}/editar">✎ Editar</a>`, `<button class="btn ghost" data-act="delete" data-id="${d.id}">🗑</button>`);
 
@@ -602,6 +603,7 @@ document.addEventListener("click", async (e) => {
     const id = b.dataset.id, act = b.dataset.act;
     if (act === "enqueue") await guarded(() => api("POST", `/api/demands/${id}/enqueue`), "Missão enviada para a fila");
     if (act === "cancel") { if (confirm("Interromper esta missão? O trabalho já feito na branch é preservado.")) await guarded(() => api("POST", `/api/demands/${id}/cancel`), "Cancelamento solicitado"); }
+    if (act === "apply-branch") { const r = await guarded(() => api("POST", `/api/demands/${id}/apply-branch`, {})); if (r?.message) toast(r.message, "ok"); }
     if (act === "approve-review") { const note = prompt("Aprovar e concluir. Observação (opcional):", ""); if (note !== null) await guarded(() => api("POST", `/api/demands/${id}/approve-review`, { note }), "Missão concluída!"); }
     if (act === "approve-spec") await guarded(() => api("POST", `/api/demands/${id}/approve-spec`, { spec: $("#spec-edit")?.value || "" }), "Especificação aprovada");
     if (act === "adjust") return adjustModal(id);

@@ -21,68 +21,101 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// Branch selecionada = branch em checkout no repositório principal:
-// nenhuma branch nova e o checkout é atualizado por fast-forward.
-func TestDirectBranchCheckedOut(t *testing.T) {
-	e, st, p := setup(t, fakeAgent)
-	branchesAntes := gitOut(t, p.Path, "branch", "--list")
-	d := domain.Demand{Ticket: "CH-7", Title: "Direto", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
-	if _, err := st.CreateDemand(&d, "Criar feature.txt contendo ok"); err != nil {
-		t.Fatal(err)
-	}
-	e.Enqueue(d.ID)
-	got := waitFor(t, st, d.ID, func(x domain.Demand) bool {
-		return (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
-	})
-	if got.Stage != domain.StageReview || got.WorkBranch != "main" || !got.DirectBranch || got.BaseCommit == "" {
-		t.Fatalf("estado: %s %s branch=%s base=%s", got.Stage, got.StatusMessage, got.WorkBranch, got.BaseCommit)
-	}
-	if b := gitOut(t, p.Path, "branch", "--list"); b != branchesAntes {
-		t.Fatalf("branch nova criada: %q", b)
-	}
-	b, err := os.ReadFile(filepath.Join(p.Path, "feature.txt"))
-	if err != nil || strings.TrimSpace(string(b)) != "ok" {
-		t.Fatalf("o commit não chegou ao checkout da branch selecionada: %q %v", b, err)
-	}
-	if gitOut(t, p.Path, "status", "--porcelain") != "" {
-		t.Fatal("checkout principal ficou sujo após o fast-forward")
-	}
-	runs, _ := st.ListRuns(d.ID)
-	if !strings.Contains(runs[0].DiffStat, "feature.txt") {
-		t.Fatalf("diff deveria comparar com o commit inicial: %q", runs[0].DiffStat)
-	}
-	// ajuste: novo commit na mesma branch
-	rev, _ := e.NewAdjustment(d.ID, "AJUSTE-EXTRA")
-	e.FinishAdjustment(d.ID, rev, true)
-	got = waitFor(t, st, d.ID, func(x domain.Demand) bool {
-		return x.CurrentRevision == 2 && (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
-	})
-	b, _ = os.ReadFile(filepath.Join(p.Path, "feature.txt"))
-	if got.Stage != domain.StageReview || !strings.Contains(string(b), "extra") {
-		t.Fatalf("ajuste não aplicado na branch: %s %q", got.StatusMessage, b)
-	}
-	if n := gitOut(t, p.Path, "rev-list", "--count", got.BaseCommit+"..main"); n != "2" {
-		t.Fatalf("esperava 2 commits da demanda em main, obtido %s", n)
-	}
-	e.ApproveReview(d.ID, "")
-	got, _ = st.GetDemand(d.ID)
-	if !strings.Contains(got.StatusMessage, "aplicadas na branch main") {
-		t.Fatal(got.StatusMessage)
+func emRevisao(e *Engine, rev int) func(domain.Demand) bool {
+	return func(x domain.Demand) bool {
+		return x.CurrentRevision == rev && (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
 	}
 }
 
-// Branch selecionada que não está em checkout: avança a ref; checkout intacto.
+// Branch selecionada em checkout (ex.: aberta no Visual Studio): ao aprovar,
+// as alterações aparecem no checkout como alterações pendentes (Git Changes).
+func TestDirectBranchCheckedOut(t *testing.T) {
+	e, st, p := setup(t, fakeAgent)
+	branchesAntes := gitOut(t, p.Path, "branch", "--list")
+	headAntes := gitOut(t, p.Path, "rev-parse", "HEAD")
+	// alteração local do usuário em outro arquivo: deve ser preservada
+	os.WriteFile(filepath.Join(p.Path, "README.md"), []byte("demo\nminha alteração\n"), 0o644)
+
+	d := domain.Demand{Ticket: "CH-7", Title: "Direto", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
+	st.CreateDemand(&d, "Criar feature.txt contendo ok")
+	e.Enqueue(d.ID)
+	got := waitFor(t, st, d.ID, emRevisao(e, 1))
+	if got.Stage != domain.StageReview || got.WorkBranch != "main" || got.BaseCommit == "" {
+		t.Fatalf("estado: %s %s branch=%s", got.Stage, got.StatusMessage, got.WorkBranch)
+	}
+	if _, err := os.Stat(filepath.Join(p.Path, "feature.txt")); err == nil {
+		t.Fatal("antes da aprovação o checkout não deve mudar")
+	}
+	// ajuste antes de aprovar
+	rev, _ := e.NewAdjustment(d.ID, "AJUSTE-EXTRA")
+	e.FinishAdjustment(d.ID, rev, true)
+	got = waitFor(t, st, d.ID, emRevisao(e, 2))
+	if got.Stage != domain.StageReview {
+		t.Fatalf("ajuste: %s", got.StatusMessage)
+	}
+	if err := e.ApproveReview(d.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(p.Path, "feature.txt"))
+	if !strings.Contains(string(b), "ok") || !strings.Contains(string(b), "extra") {
+		t.Fatalf("alterações não aplicadas no checkout: %q", b)
+	}
+	if gitOut(t, p.Path, "rev-parse", "HEAD") != headAntes || gitOut(t, p.Path, "branch", "--list") != branchesAntes {
+		t.Fatal("não deveria criar commit nem branch no checkout do usuário")
+	}
+	if st := gitOut(t, p.Path, "status", "--porcelain"); !strings.Contains(st, "?? feature.txt") || !strings.Contains(st, "M README.md") {
+		t.Fatalf("esperava alterações pendentes (Git Changes): %q", st)
+	}
+	if r, _ := os.ReadFile(filepath.Join(p.Path, "README.md")); !strings.Contains(string(r), "minha alteração") {
+		t.Fatal("alteração local do usuário perdida")
+	}
+	got, _ = st.GetDemand(d.ID)
+	if got.Stage != domain.StageDone || !strings.Contains(got.StatusMessage, "alterações pendentes") {
+		t.Fatalf("%s %s", got.Stage, got.StatusMessage)
+	}
+	// reaplicar é seguro
+	if msg, err := e.ApplyToBranch(d.ID); err != nil || !strings.Contains(msg, "já estavam") {
+		t.Fatalf("reaplicação: %q %v", msg, err)
+	}
+}
+
+// Conflito com alteração local no mesmo trecho: nada é alterado e a demanda
+// continua em Revisão.
+func TestDirectBranchConflict(t *testing.T) {
+	e, st, p := setup(t, fakeAgent)
+	d := domain.Demand{Ticket: "CH-9", Title: "Conflito", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
+	st.CreateDemand(&d, "Criar feature.txt contendo ok")
+	e.Enqueue(d.ID)
+	waitFor(t, st, d.ID, emRevisao(e, 1))
+	os.WriteFile(filepath.Join(p.Path, "feature.txt"), []byte("meu\n"), 0o644)
+	if err := e.ApproveReview(d.ID, ""); err == nil || !strings.Contains(err.Error(), "conflitam") {
+		t.Fatalf("esperava conflito: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(p.Path, "feature.txt")); string(b) != "meu\n" {
+		t.Fatal("arquivo do usuário foi alterado")
+	}
+	if got, _ := st.GetDemand(d.ID); got.Stage != domain.StageReview {
+		t.Fatalf("deveria continuar em revisão: %s", got.Stage)
+	}
+	os.Remove(filepath.Join(p.Path, "feature.txt"))
+	if err := e.ApproveReview(d.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Branch fora de checkout: ao aprovar, commit + fast-forward da própria branch.
 func TestDirectBranchNotCheckedOut(t *testing.T) {
 	e, st, p := setup(t, fakeAgent)
 	gitOut(t, p.Path, "branch", "release")
 	d := domain.Demand{Ticket: "CH-8", Title: "Release", ProjectID: p.ID, Provider: "generico", DirectBranch: true, BaseBranch: "release"}
 	st.CreateDemand(&d, "Criar feature.txt contendo ok")
 	e.Enqueue(d.ID)
-	got := waitFor(t, st, d.ID, func(x domain.Demand) bool {
-		return (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
-	})
+	got := waitFor(t, st, d.ID, emRevisao(e, 1))
 	if got.Stage != domain.StageReview || got.WorkBranch != "release" {
 		t.Fatalf("%s %s %s", got.Stage, got.WorkBranch, got.StatusMessage)
+	}
+	if err := e.ApproveReview(d.ID, ""); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(p.Path, "feature.txt")); err == nil {
 		t.Fatal("o checkout de main não deveria mudar")
@@ -93,6 +126,5 @@ func TestDirectBranchNotCheckedOut(t *testing.T) {
 	if b := gitOut(t, p.Path, "branch", "--list"); strings.Count(b, "\n") != 1 {
 		t.Fatalf("branches inesperadas: %q", b)
 	}
-	// a branch continua livre para checkout normal pelo usuário
 	gitOut(t, p.Path, "checkout", "-q", "release")
 }

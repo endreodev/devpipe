@@ -750,7 +750,6 @@ func (e *Engine) RepairEncoding(id int64) (encx.Report, error) {
 	if p.AutoCommit && len(repo.ChangedFiles()) > 0 {
 		if sha, err := repo.CommitAll(d.Ticket + ": correção de codificação de caracteres (DevPipe)"); err == nil && sha != "" {
 			e.log(d, 0, domain.LevelOK, "git", "Commit local de reparo criado ("+sha[:min(10, len(sha))]+")", "")
-			e.publish(d, 0, sha)
 		}
 	}
 	return rep, nil
@@ -771,8 +770,7 @@ func (e *Engine) commitIfConfigured(rs *runState, p domain.Project, repo gitx.Re
 	if sha != "" {
 		rs.run.CommitSHA = sha
 		if d.DirectBranch {
-			e.log(*d, rs.run.ID, domain.LevelOK, "git", "Commit local criado ("+sha[:min(10, len(sha))]+")", "")
-			e.publish(*d, rs.run.ID, sha)
+			e.log(*d, rs.run.ID, domain.LevelOK, "git", "Commit criado na área de trabalho da demanda ("+sha[:min(10, len(sha))]+"). Ao aprovar, as alterações vão para a branch "+d.WorkBranch+".", "")
 		} else {
 			e.log(*d, rs.run.ID, domain.LevelOK, "git", "Commit local criado na branch "+d.WorkBranch+" ("+sha[:min(10, len(sha))]+") — nenhum push realizado", "")
 		}
@@ -880,22 +878,80 @@ func (e *Engine) prepareDirect(rs *runState, main gitx.Repo, wt string) error {
 	return nil
 }
 
-// publish aplica o commit da demanda na branch selecionada (modo direto).
-func (e *Engine) publish(d domain.Demand, runID int64, sha string) {
-	if !d.DirectBranch || sha == "" {
-		return
+// ApplyToBranch leva o trabalho de uma demanda "direto na branch" para a
+// branch selecionada:
+//   - se a branch estiver em checkout (ex.: aberta no Visual Studio), aplica as
+//     alterações nos arquivos como ALTERAÇÕES PENDENTES (aparecem no Git
+//     Changes para você revisar e commitar). Não faz commit, não mexe no índice
+//     nem em outros arquivos; se algum trecho conflitar com alterações locais,
+//     nada é aplicado e o patch é salvo para aplicação manual;
+//   - se a branch não estiver em checkout, cria o commit e avança a branch por
+//     fast-forward.
+func (e *Engine) ApplyToBranch(id int64) (string, error) {
+	d, err := e.load(id)
+	if err != nil {
+		return "", err
+	}
+	if !d.DirectBranch {
+		return "", errors.New("esta demanda usa uma branch própria (" + d.WorkBranch + "); faça o merge manualmente")
+	}
+	if d.WorktreePath == "" || d.BaseCommit == "" {
+		return "", errors.New("a demanda ainda não tem alterações preparadas")
+	}
+	if e.IsRunning(id) {
+		return "", errors.New("aguarde a execução terminar")
 	}
 	p, err := e.st.GetProject(d.ProjectID)
 	if err != nil {
-		return
+		return "", err
 	}
-	onde, err := (gitx.Repo{Dir: p.Path}).PublishToBranch(d.WorkBranch, sha)
+	main := gitx.Repo{Dir: p.Path}
+	wt := gitx.Repo{Dir: d.WorktreePath}
+	dir := main.WorktreeOfBranch(d.WorkBranch)
+	if dir == "" {
+		// branch fora de checkout: commit + fast-forward da própria branch
+		if len(wt.ChangedFiles()) > 0 {
+			if _, err := wt.CommitAll(d.Ticket + ": " + d.Title + " (DevPipe)"); err != nil {
+				return "", err
+			}
+		}
+		onde, err := main.PublishToBranch(d.WorkBranch, wt.HeadSHA())
+		if err != nil {
+			return "", err
+		}
+		msg := "Alterações gravadas na branch " + d.WorkBranch + " — " + onde + " (sem push)."
+		e.log(d, 0, domain.LevelOK, "git", msg, "")
+		return msg, nil
+	}
+	patch, err := wt.PatchSince(d.BaseCommit)
 	if err != nil {
-		e.log(d, runID, domain.LevelWarn, "git", "O commit "+sha[:min(10, len(sha))]+" NÃO foi aplicado na branch "+d.WorkBranch+": "+err.Error(),
-			"O trabalho está preservado em "+d.WorktreePath+".\nPara aplicar manualmente no seu checkout: git merge --ff-only "+sha+"\n(ou git cherry-pick "+sha+" se a branch tiver avançado)")
-		return
+		return "", err
 	}
-	e.log(d, runID, domain.LevelOK, "git", "Commit "+sha[:min(10, len(sha))]+" aplicado na branch "+d.WorkBranch+" — "+onde+" — nenhum push realizado", "")
+	if len(patch) == 0 {
+		return "", errors.New("não há alterações da demanda para aplicar")
+	}
+	arquivos := wt.PatchFiles(d.BaseCommit)
+	pdir := filepath.Join(e.dataDir, "patches")
+	os.MkdirAll(pdir, 0o755)
+	patchPath := filepath.Join(pdir, fmt.Sprintf("%d-%s.patch", d.ID, sanitize(d.Ticket)))
+	if err := os.WriteFile(patchPath, patch, 0o644); err != nil {
+		return "", err
+	}
+	if cur, _ := (gitx.Repo{Dir: dir}).CurrentBranch(); cur != d.WorkBranch {
+		return "", fmt.Errorf("o checkout %s não está na branch %s", dir, d.WorkBranch)
+	}
+	ja, err := (gitx.Repo{Dir: dir}).ApplyPatchToWorkingTree(patchPath)
+	if err != nil {
+		e.log(d, 0, domain.LevelWarn, "git", "As alterações NÃO foram aplicadas em "+dir+": conflitam com alterações locais nos mesmos trechos. Nada foi modificado.",
+			err.Error()+"\n\nPatch salvo em: "+patchPath+"\nPara aplicar com marcação de conflitos: git apply --3way \""+patchPath+"\"")
+		return "", fmt.Errorf("as alterações conflitam com mudanças locais no seu checkout (%s); nada foi modificado. Salve/commite ou desfaça as alterações locais nesses arquivos e clique em \"Aplicar na branch\" de novo. Patch salvo em %s", strings.Join(arquivos, ", "), patchPath)
+	}
+	if ja {
+		return "As alterações já estavam aplicadas no checkout " + dir + ".", nil
+	}
+	msg := fmt.Sprintf("%d arquivo(s) alterado(s) no seu checkout %s (branch %s) como alterações pendentes — revise no Git Changes e faça o commit.", len(arquivos), dir, d.WorkBranch)
+	e.log(d, 0, domain.LevelOK, "git", msg, strings.Join(arquivos, "\n"))
+	return msg, nil
 }
 
 // validate executa os comandos oficiais de build e teste do projeto.

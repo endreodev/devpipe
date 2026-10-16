@@ -6,9 +6,27 @@ import (
 
 	"devpipe/internal/domain"
 	"devpipe/internal/security"
+	"devpipe/internal/textx"
 )
 
-const maxAttachmentText = 180 << 10 // limite total de texto de anexos no prompt
+const maxAttachmentText = 120 << 10 // limite total de texto de anexos no prompt
+
+// maxFixLog: tamanho máximo da saída de validação enviada ao agente na correção.
+// A saída é compactada (ruído removido, erros priorizados) antes do corte.
+const maxFixLog = 8000
+
+// economyBlock: orientações para o agente gastar menos contexto. Cada leitura
+// ou saída de comando fica no histórico e é reenviada em todos os passos
+// seguintes da sessão, então evitar leituras desnecessárias reduz o consumo
+// de forma multiplicativa.
+const economyBlock = `
+## ECONOMIA DE CONTEXTO (obrigatório)
+- Localize com Grep/Glob usando padrões e caminhos específicos antes de abrir arquivos; não liste diretórios inteiros nem varra o repositório.
+- Em arquivos grandes, leia apenas o trecho necessário (Read com offset/limit). Não releia arquivos que já leu nesta sessão, a menos que tenham mudado.
+- Prefira Edit/MultiEdit pontuais a reescrever arquivos com Write.
+- Execute build/testes no máximo uma vez por rodada de verificação e, quando a ferramenta permitir, com saída resumida (ex.: -q, --quiet, --verbosity quiet, --silent).
+- Respostas e resumos curtos: sem repetir código, especificação ou saídas de comando.
+`
 
 type promptCtx struct {
 	D            domain.Demand
@@ -22,6 +40,10 @@ type promptCtx struct {
 	DiffStat     string   // alterações já existentes na branch de trabalho
 	AllowedCmds  []string // prefixos de comando liberados ao agente
 	EncodingNote string   // aviso de codificação (projetos Windows-1252)
+	// Resumed: o prompt continua uma sessão do agente que já recebeu cabeçalho,
+	// regras, solicitação e especificação. Nesse caso esses blocos não são
+	// reenviados (economia de tokens: o histórico já os contém).
+	Resumed bool
 }
 
 func commandsBlock(c promptCtx) string {
@@ -71,7 +93,7 @@ func attachmentsBlock(atts []attachmentCtx, onlyRev int) string {
 		}
 		any = true
 		if a.Text != "" && budget > 0 {
-			t := a.Text
+			t := textx.Compact(a.Text)
 			if len(t) > budget {
 				t = t[:budget] + "\n…(texto truncado; leia o arquivo original se necessário: " + a.AbsPath + ")"
 			}
@@ -93,7 +115,8 @@ func analysisPrompt(c promptCtx) string {
 	b.WriteString("\n## SUA TAREFA NESTA ETAPA: ANÁLISE E PLANEJAMENTO (somente leitura)\n")
 	b.WriteString("Você NÃO deve alterar arquivos agora. Leia a solicitação e os anexos e examine SOMENTE os arquivos do repositório necessários para entender o que mudar (use Grep/Glob para localizar; leia apenas os trechos relevantes). Seja rápido e objetivo: não faça varreduras amplas, não investigue histórico Git nem alterações locais, e não verifique codificação de caracteres (a aplicação cuida disso).\n")
 	b.WriteString("O diretório atual é a branch de trabalho desta demanda; os arquivos que você ler aqui serão os editados no desenvolvimento, que continuará esta mesma sessão.\n")
-	b.WriteString("Não invente regras de negócio ausentes: quando algo não estiver claro, registre em 'Pontos que precisam de esclarecimento' ou 'Pressupostos'.\n\n")
+	b.WriteString("Não invente regras de negócio ausentes: quando algo não estiver claro, registre em 'Pontos que precisam de esclarecimento' ou 'Pressupostos'.\n")
+	b.WriteString(economyBlock + "\n")
 
 	if c.Rev.Number > 1 {
 		b.WriteString("## CONTEXTO: ESTA É UMA DEVOLUÇÃO PARA AJUSTES (revisão " + fmt.Sprint(c.Rev.Number) + ")\n")
@@ -147,8 +170,20 @@ Responda APENAS com um documento Markdown, em português, CONCISO (frases curtas
 
 func developPrompt(c promptCtx, spec string) string {
 	var b strings.Builder
-	b.WriteString(header(c))
-	if c.Rev.Number > 1 {
+	if c.Resumed {
+		// mesma sessão da análise: cabeçalho, solicitação, anexos, regras e a
+		// própria especificação (escrita pelo agente) já estão no histórico.
+		b.WriteString("## PRÓXIMA ETAPA: IMPLEMENTAÇÃO\n")
+		b.WriteString("A especificação e o plano que você acabou de produzir nesta sessão foram APROVADOS. Implemente-os agora, seguindo as regras e padrões já informados acima nesta sessão (continuam valendo integralmente). Reaproveite o que já leu; não releia arquivos sem necessidade.\n")
+		if c.Rev.Number > 1 {
+			b.WriteString("Esta é uma revisão de ajustes: implemente SOMENTE os ajustes especificados; não duplique nem desfaça alterações existentes sem justificativa.\n")
+		}
+	} else {
+		b.WriteString(header(c))
+	}
+	if c.Resumed {
+		// nada a repetir
+	} else if c.Rev.Number > 1 {
 		fmt.Fprintf(&b, "\n## SUA TAREFA: IMPLEMENTAR OS AJUSTES DA REVISÃO %d\n", c.Rev.Number)
 		b.WriteString("O diretório atual já contém a implementação anterior desta demanda. Implemente SOMENTE os ajustes da especificação abaixo; não duplique nem desfaça alterações existentes sem justificativa.\n")
 		if c.DiffStat != "" {
@@ -161,9 +196,12 @@ func developPrompt(c promptCtx, spec string) string {
 	} else {
 		b.WriteString("\n## SUA TAREFA: IMPLEMENTAR A DEMANDA\n")
 	}
-	b.WriteString("\n## ESPECIFICAÇÃO APROVADA\n<especificacao>\n" + spec + "\n</especificacao>\n")
-	b.WriteString("\n## REGRAS E PADRÕES\n" + c.Rules + "\n")
+	if !c.Resumed {
+		b.WriteString("\n## ESPECIFICAÇÃO APROVADA\n<especificacao>\n" + spec + "\n</especificacao>\n")
+		b.WriteString("\n## REGRAS E PADRÕES\n" + c.Rules + "\n")
+	}
 	b.WriteString(commandsBlock(c))
+	b.WriteString(economyBlock)
 	b.WriteString(`
 ## COMO TRABALHAR
 - Você está em uma worktree Git isolada criada para esta demanda. Edite os arquivos diretamente com as ferramentas de edição.
@@ -188,14 +226,25 @@ func developPrompt(c promptCtx, spec string) string {
 
 func fixPrompt(c promptCtx, spec, failures string, attempt int) string {
 	var b strings.Builder
-	b.WriteString(header(c))
+	if !c.Resumed {
+		b.WriteString(header(c))
+	}
 	fmt.Fprintf(&b, "\n## SUA TAREFA: CORRIGIR FALHAS DE VALIDAÇÃO (tentativa %d)\n", attempt)
 	b.WriteString("A validação oficial da aplicação falhou após a implementação. Analise a saída abaixo, identifique a causa e corrija com a menor alteração possível, sem fugir do escopo da especificação.\n")
-	b.WriteString("\n## SAÍDA DA VALIDAÇÃO\n```\n" + failures + "\n```\n")
-	b.WriteString("\n## ESPECIFICAÇÃO\n<especificacao>\n" + spec + "\n</especificacao>\n")
-	b.WriteString("\n## REGRAS E PADRÕES\n" + c.Rules + "\n")
-	b.WriteString(commandsBlock(c))
-	b.WriteString("\nResponda ao final com: ## Causa identificada, ## Correção aplicada, ## Arquivos alterados, ## Pendências.\n")
+	if c.Resumed {
+		b.WriteString("A especificação, as regras e os comandos liberados já informados nesta sessão continuam valendo. Não releia arquivos que já conhece; vá direto aos pontos indicados pelos erros.\n")
+	}
+	b.WriteString("\n## SAÍDA DA VALIDAÇÃO (compactada: ruído removido, linhas de erro priorizadas)\n```\n" + textx.CompactLog(failures, maxFixLog) + "\n```\n")
+	if c.Resumed {
+		if c.EncodingNote != "" {
+			b.WriteString("\n## CODIFICAÇÃO DOS ARQUIVOS\n" + c.EncodingNote + "\n")
+		}
+	} else {
+		b.WriteString("\n## ESPECIFICAÇÃO\n<especificacao>\n" + spec + "\n</especificacao>\n")
+		b.WriteString("\n## REGRAS E PADRÕES\n" + c.Rules + "\n")
+		b.WriteString(commandsBlock(c))
+	}
+	b.WriteString("\nResponda de forma curta ao final com: ## Causa identificada, ## Correção aplicada, ## Arquivos alterados, ## Pendências.\n")
 	return b.String()
 }
 

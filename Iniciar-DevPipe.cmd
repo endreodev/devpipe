@@ -17,7 +17,8 @@ if defined NOVA (
     pause
     exit /b 1
   )
-  del "dist\%NOVA%" >nul 2>&1
+  rem remove todas as versoes pendentes (evita reinstalar uma versao antiga depois)
+  del "dist\devpipe-v*.exe" >nul 2>&1
   echo Atualizado para %NOVA%
 )
 

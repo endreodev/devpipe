@@ -520,6 +520,7 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 			e.log(d, run.ID, domain.LevelInfo, "sessao", "Desenvolvimento continua a sessão da análise (o agente já conhece os arquivos analisados)", "")
 		}
 		dctx, cancel := context.WithTimeout(ctx, agentTimeout)
+		pc.Resumed = analysisSession != "" // sessão continuada: não reenvia regras/especificação
 		res, err := prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
 			Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
 			ResumeSession: analysisSession, EncodingManifest: mpath}, e.agentEmitter(rs))
@@ -531,6 +532,7 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 				// sessão anterior indisponível: nova sessão do zero
 				e.log(d, run.ID, domain.LevelWarn, "sessao", "Não foi possível continuar a sessão da análise; iniciando nova sessão", err.Error())
 				dctx, cancel = context.WithTimeout(ctx, agentTimeout)
+				pc.Resumed = false // sessão nova: precisa do contexto completo
 				res, err = prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
 					Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
 					EncodingManifest: mpath}, e.agentEmitter(rs))
@@ -568,10 +570,25 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		fman, fpath := e.encPrepare(rs, wt, prov)
 		pc.EncodingNote = encodingNote(fman, fpath != "")
 		fctx, cancel := context.WithTimeout(ctx, agentTimeout)
+		pc.Resumed = run.SessionID != "" // continua a sessão do desenvolvimento
 		res, err := prov.Run(fctx, provider.Request{Phase: provider.PhaseFix, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
 			Prompt: fixPrompt(pc, rev.Spec, output, attempt), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
 			ResumeSession: run.SessionID, EncodingManifest: fpath}, e.agentEmitter(rs))
 		cancel()
+		if err != nil && pc.Resumed && res.SessionID == "" && ctx.Err() == nil {
+			var lim *provider.ErrPlanLimit
+			var pol *provider.ErrPolicy
+			if !errors.As(err, &lim) && !errors.As(err, &pol) {
+				// sessão anterior indisponível: nova sessão com o contexto completo
+				e.log(d, run.ID, domain.LevelWarn, "sessao", "Não foi possível continuar a sessão do desenvolvimento; correção em nova sessão", err.Error())
+				pc.Resumed = false
+				fctx, cancel = context.WithTimeout(ctx, agentTimeout)
+				res, err = prov.Run(fctx, provider.Request{Phase: provider.PhaseFix, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
+					Prompt: fixPrompt(pc, rev.Spec, output, attempt), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
+					EncodingManifest: fpath}, e.agentEmitter(rs))
+				cancel()
+			}
+		}
 		e.encRestore(rs, p, wt, fman, fpath)
 		run.CostUSD += res.CostUSD
 		if res.SessionID != "" {

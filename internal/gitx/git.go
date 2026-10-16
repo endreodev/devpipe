@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,6 +69,51 @@ func (r Repo) Validate() (top string, err error) {
 		return "", fmt.Errorf("o diretório não é um repositório Git válido")
 	}
 	return filepath.FromSlash(top), nil
+}
+
+// defaultGitignore evita versionar saídas de build e dependências quando o
+// DevPipe cria o repositório de um projeto novo (só é gravado se não existir).
+const defaultGitignore = `bin/
+obj/
+node_modules/
+.vs/
+*.user
+*.suo
+`
+
+// Init cria um repositório Git LOCAL (sem remoto) em r.Dir para projetos que
+// ainda não têm repositório: cria a pasta se preciso, define a branch "main"
+// e faz um commit inicial com os arquivos já existentes (ou vazio, se a pasta
+// estiver vazia). Retorna o caminho raiz do repositório criado.
+func (r Repo) Init() (string, error) {
+	if err := os.MkdirAll(r.Dir, 0o755); err != nil {
+		return "", fmt.Errorf("não foi possível criar a pasta %s: %w", r.Dir, err)
+	}
+	if top, err := r.Validate(); err == nil {
+		return top, nil // já é um repositório (ou está dentro de um)
+	}
+	if _, err := r.git("init"); err != nil {
+		return "", err
+	}
+	if _, err := r.git("symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		return "", err
+	}
+	gi := filepath.Join(r.Dir, ".gitignore")
+	if _, err := os.Stat(gi); errors.Is(err, os.ErrNotExist) {
+		os.WriteFile(gi, []byte(defaultGitignore), 0o644)
+	}
+	if _, err := r.git("add", "-A"); err != nil {
+		return "", err
+	}
+	args := []string{"commit", "--allow-empty", "-q", "-m", "Commit inicial (repositório criado pelo DevPipe)"}
+	if email, _ := r.git("config", "user.email"); strings.TrimSpace(email) == "" {
+		// sem identidade Git configurada na máquina: usa uma identidade local só para este commit
+		args = append([]string{"-c", "user.name=DevPipe", "-c", "user.email=devpipe@localhost"}, args...)
+	}
+	if _, err := r.git(args...); err != nil {
+		return "", err
+	}
+	return r.Validate()
 }
 
 func (r Repo) CurrentBranch() (string, error) {
@@ -576,4 +622,63 @@ func (r Repo) ApplyPatchToWorkingTree(patchPath string) (jaAplicado bool, err er
 		return true, nil
 	}
 	return false, r.applyFile(patchPath, "--check")
+}
+
+// FileChange descreve um arquivo alterado em relação à base.
+type FileChange struct {
+	Path    string `json:"path"`
+	Status  string `json:"status"` // A (novo) | M (alterado) | D (excluído) | T (tipo)
+	Added   int    `json:"added"`
+	Removed int    `json:"removed"`
+	Binary  bool   `json:"binary"`
+}
+
+func (r Repo) diffBase(base string) string {
+	if mb, err := r.git("merge-base", base, "HEAD"); err == nil {
+		return mb
+	}
+	return base
+}
+
+// DiffFiles lista os arquivos alterados (inclui arquivos novos não commitados).
+func (r Repo) DiffFiles(base string) ([]FileChange, error) {
+	mb := r.diffBase(base)
+	r.git("add", "-N", ".")
+	ns, err := r.git("-c", "core.quotepath=false", "diff", "--no-renames", "--name-status", mb)
+	if err != nil {
+		return nil, err
+	}
+	nums, _ := r.git("-c", "core.quotepath=false", "diff", "--no-renames", "--numstat", mb)
+	cont := map[string][3]int{} // added, removed, binário
+	for _, l := range strings.Split(nums, "\n") {
+		p := strings.SplitN(l, "\t", 3)
+		if len(p) != 3 {
+			continue
+		}
+		if p[0] == "-" {
+			cont[p[2]] = [3]int{0, 0, 1}
+			continue
+		}
+		a, _ := strconv.Atoi(p[0])
+		d, _ := strconv.Atoi(p[1])
+		cont[p[2]] = [3]int{a, d, 0}
+	}
+	var out []FileChange
+	for _, l := range strings.Split(ns, "\n") {
+		p := strings.SplitN(l, "\t", 2)
+		if len(p) != 2 {
+			continue
+		}
+		c := cont[p[1]]
+		out = append(out, FileChange{Path: p[1], Status: p[0][:1], Added: c[0], Removed: c[1], Binary: c[2] == 1})
+	}
+	return out, nil
+}
+
+// FileDiff devolve o diff de um arquivo com o arquivo inteiro como contexto
+// (usado pelo comparador lado a lado).
+func (r Repo) FileDiff(base, path string) ([]byte, error) {
+	mb := r.diffBase(base)
+	r.git("add", "-N", ".")
+	return r.gitRaw("-c", "core.quotepath=false", "diff", "--no-renames", "--no-color", "-U1000000", mb, "--", path)
 }

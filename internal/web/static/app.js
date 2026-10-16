@@ -94,6 +94,174 @@ function renderDiff(text) {
   }).join("") + "</div>";
 }
 
+// ------------------------------------------------------------ comparador (lado a lado / linha por linha)
+let pendingCmp = null;
+const CMP = { demandId: 0, file: "", mode: localStorage.getItem("devpipe.cmpMode") || "lado", onlyChanges: localStorage.getItem("devpipe.cmpOnly") === "1", collapsed: new Set(), filter: "", scroll: 0, full: false };
+
+// Converte o diff (arquivo inteiro como contexto) em linhas alinhadas.
+function parseFullDiff(text) {
+  const rows = [];
+  let o = 0, n = 0, started = false, dels = [], adds = [];
+  const flush = () => {
+    const k = Math.max(dels.length, adds.length);
+    for (let i = 0; i < k; i++) rows.push({ t: dels[i] && adds[i] ? "m" : dels[i] ? "d" : "a", l: dels[i] || null, r: adds[i] || null });
+    dels = []; adds = [];
+  };
+  for (const line of text.split("\n")) {
+    if (!started) {
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
+      if (m) { started = true; o = +m[1] || 1; n = +m[2] || 1; if (+m[1] === 0) o = 1; if (+m[2] === 0) n = 1; }
+      continue;
+    }
+    if (line.startsWith("@@")) { flush(); const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line); if (m) { o = +m[1]; n = +m[2]; } continue; }
+    const c = line[0], tx = line.slice(1).replace(/\r$/, "");
+    if (c === "-") dels.push({ n: o++, tx });
+    else if (c === "+") adds.push({ n: n++, tx });
+    else if (c === " ") { flush(); rows.push({ t: "c", l: { n: o++, tx }, r: { n: n++, tx } }); }
+    else if (c === "\\") continue;
+  }
+  flush();
+  return rows;
+}
+
+// destaca a parte alterada entre duas linhas (prefixo/sufixo comuns)
+function intraLine(a, b) {
+  let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let s = 0; while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  const mk = (x) => esc(x.slice(0, p)) + (x.length - s > p ? `<mark>${esc(x.slice(p, x.length - s))}</mark>` : "") + esc(x.slice(x.length - s));
+  return [mk(a), mk(b)];
+}
+
+function fileIcon(path) {
+  const ext = (path.split(".").pop() || "").toLowerCase();
+  return { cs: "C#", sql: "SQL", js: "JS", ts: "TS", aspx: "◇", ascx: "◇", xml: "‹›", xsd: "‹›", config: "⚙", json: "{}", css: "#", html: "‹›", md: "¶", txt: "≡", vb: "VB", py: "Py", go: "Go" }[ext] || "▢";
+}
+
+function buildTree(files) {
+  const root = { dirs: new Map(), files: [] };
+  for (const f of files) {
+    const parts = f.path.split("/"); let node = root, acc = "";
+    for (const p of parts.slice(0, -1)) { acc += (acc ? "/" : "") + p; if (!node.dirs.has(p)) node.dirs.set(p, { path: acc, dirs: new Map(), files: [] }); node = node.dirs.get(p); }
+    node.files.push(f);
+  }
+  // compacta pastas com um único filho (Base/Context, como no Visual Studio)
+  const compact = (name, n) => { while (n.files.length === 0 && n.dirs.size === 1) { const [k, v] = [...n.dirs][0]; name += "/" + k; n = v; } return [name, n]; };
+  return { root, compact };
+}
+
+async function mountComparator(box, d, files) {
+  if (CMP.demandId !== d.id) { CMP.demandId = d.id; CMP.file = ""; CMP.collapsed = new Set(); CMP.scroll = 0; }
+  if (!files.length) { box.innerHTML = emptyState("Sem alterações", "A demanda ainda não alterou arquivos."); return; }
+  if (!files.find((f) => f.path === CMP.file)) CMP.file = (files.find((f) => f.status !== "D") || files[0]).path;
+  const totA = files.reduce((s, f) => s + f.added, 0), totD = files.reduce((s, f) => s + f.removed, 0);
+  box.innerHTML = `<div class="cmp ${CMP.full ? "full" : ""}">
+    <div class="cmp-bar">
+      <span class="cmp-all">Todas as alterações <b>${files.length}</b> <span class="ad">+${totA}</span> <span class="dl">−${totD}</span></span>
+      <input class="cmp-filter" placeholder="Filtrar arquivos…" value="${esc(CMP.filter)}">
+      <div class="cmp-cur"><b id="cmp-name"></b><span class="mono small muted" id="cmp-path"></span></div>
+      <span class="grow"></span>
+      <label class="small muted cmp-chk"><input type="checkbox" id="cmp-only" ${CMP.onlyChanges ? "checked" : ""}> Só trechos alterados</label>
+      <div class="seg"><button data-mode="lado" class="${CMP.mode === "lado" ? "on" : ""}" title="Comparação lado a lado">◫ Lado a lado</button><button data-mode="linha" class="${CMP.mode === "linha" ? "on" : ""}" title="Linha por linha (unificado)">☰ Linha por linha</button></div>
+      <button class="btn sm" id="cmp-prev" title="Alteração anterior (Shift+F7)">↑</button><button class="btn sm" id="cmp-next" title="Próxima alteração (F7)">↓</button>
+      <button class="btn sm" id="cmp-full" title="Tela cheia">⤢</button>
+    </div>
+    <div class="cmp-body"><div class="cmp-tree" id="cmp-tree"></div><div class="cmp-view" id="cmp-view"></div></div></div>`;
+  const tree = $("#cmp-tree", box), view = $("#cmp-view", box);
+
+  const drawTree = () => {
+    const q = CMP.filter.toLowerCase();
+    const vis = files.filter((f) => !q || f.path.toLowerCase().includes(q));
+    const { root, compact } = buildTree(vis);
+    const st = { A: ["novo", "add"], D: ["excluído", "del"], M: ["alterado", "mod"], T: ["tipo", "mod"] };
+    const rec = (n, depth) => {
+      let h = "";
+      for (const [k, v] of [...n.dirs].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const [name, node] = compact(k, v);
+        const closed = CMP.collapsed.has(node.path);
+        h += `<div class="ct-dir" data-dir="${esc(node.path)}" style="padding-left:${8 + depth * 14}px"><i>${closed ? "▸" : "▾"}</i> 📁 ${esc(name)}</div>`;
+        if (!closed) h += rec(node, depth + 1);
+      }
+      for (const f of n.files.sort((a, b) => a.path.localeCompare(b.path))) {
+        const nm = f.path.split("/").pop(); const s = st[f.status] || ["", "mod"];
+        h += `<div class="ct-file ${f.path === CMP.file ? "on" : ""}" data-file="${esc(f.path)}" title="${esc(f.path)} — ${s[0]}" style="padding-left:${22 + depth * 14}px"><span class="fi">${fileIcon(nm)}</span><span class="nm">${esc(nm)}</span><span class="st ${s[1]}">${esc(f.status)}</span>${f.binary ? '<span class="small muted">bin</span>' : `<span class="ad">+${f.added}</span><span class="dl">−${f.removed}</span>`}</div>`;
+      }
+      return h;
+    };
+    tree.innerHTML = vis.length ? rec(root, 0) : '<div class="small muted" style="padding:10px">Nenhum arquivo.</div>';
+    $$(".ct-dir", tree).forEach((el) => el.addEventListener("click", () => { const p = el.dataset.dir; CMP.collapsed.has(p) ? CMP.collapsed.delete(p) : CMP.collapsed.add(p); drawTree(); }));
+    $$(".ct-file", tree).forEach((el) => el.addEventListener("click", () => { CMP.file = el.dataset.file; CMP.scroll = 0; drawTree(); loadFile(); }));
+  };
+
+  let rows = [], changeStarts = [], curChange = -1;
+  const loadFile = async () => {
+    const f = files.find((x) => x.path === CMP.file); if (!f) return;
+    $("#cmp-name", box).textContent = CMP.file.split("/").pop();
+    $("#cmp-path", box).textContent = "/" + CMP.file + `  (+${f.added} −${f.removed})`;
+    view.innerHTML = '<div class="small muted" style="padding:16px">Carregando…</div>';
+    let r;
+    try { r = await api("GET", `/api/demands/${d.id}/diff/file?path=${encodeURIComponent(CMP.file)}`); }
+    catch (e) { view.innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; return; }
+    if (r.binary) { view.innerHTML = '<div class="callout info">Arquivo binário — comparação de conteúdo não disponível.</div>'; return; }
+    rows = parseFullDiff(r.diff || "");
+    drawView(r.truncated);
+  };
+
+  const drawView = (trunc) => {
+    changeStarts = []; curChange = -1;
+    rows.forEach((x, i) => { if (x.t !== "c" && (i === 0 || rows[i - 1].t === "c")) changeStarts.push(i); });
+    // "só trechos alterados": mantém 3 linhas de contexto ao redor das mudanças
+    let show = rows.map(() => true);
+    if (CMP.onlyChanges) {
+      show = rows.map(() => false);
+      rows.forEach((x, i) => { if (x.t !== "c") for (let k = Math.max(0, i - 3); k <= Math.min(rows.length - 1, i + 3); k++) show[k] = true; });
+    }
+    const parts = [];
+    let skipped = 0;
+    const gap = () => { if (skipped) { parts.push(CMP.mode === "lado" ? `<tr class="gap"><td colspan="4">⋯ ${skipped} linha(s) sem alteração</td></tr>` : `<tr class="gap"><td colspan="4">⋯ ${skipped} linha(s) sem alteração</td></tr>`); skipped = 0; } };
+    rows.forEach((x, i) => {
+      if (!show[i]) { skipped++; return; }
+      gap();
+      const id = changeStarts.includes(i) ? ` id="chg-${changeStarts.indexOf(i)}"` : "";
+      if (CMP.mode === "lado") {
+        let lt = x.l ? esc(x.l.tx) : "", rt = x.r ? esc(x.r.tx) : "";
+        if (x.t === "m") [lt, rt] = intraLine(x.l.tx, x.r.tx);
+        const lc = x.t === "c" ? "" : x.l ? "del" : "nil", rc = x.t === "c" ? "" : x.r ? "add" : "nil";
+        parts.push(`<tr${id}><td class="ln ${lc}">${x.l ? x.l.n : ""}</td><td class="tx ${lc}">${lt || (x.l ? " " : "")}</td><td class="ln ${rc}">${x.r ? x.r.n : ""}</td><td class="tx ${rc}">${rt || (x.r ? " " : "")}</td></tr>`);
+      } else {
+        if (x.t === "c") parts.push(`<tr${id}><td class="ln">${x.l.n}</td><td class="ln">${x.r.n}</td><td class="sg"> </td><td class="tx">${esc(x.l.tx) || " "}</td></tr>`);
+        else {
+          let lt = x.l ? esc(x.l.tx) : "", rt = x.r ? esc(x.r.tx) : "";
+          if (x.t === "m") [lt, rt] = intraLine(x.l.tx, x.r.tx);
+          if (x.l) parts.push(`<tr${id}><td class="ln del">${x.l.n}</td><td class="ln del"></td><td class="sg del">−</td><td class="tx del">${lt || " "}</td></tr>`);
+          if (x.r) parts.push(`<tr${x.l ? "" : id}><td class="ln add"></td><td class="ln add">${x.r.n}</td><td class="sg add">+</td><td class="tx add">${rt || " "}</td></tr>`);
+        }
+      }
+    });
+    gap();
+    const head = CMP.mode === "lado" ? `<colgroup><col class="c-ln"><col><col class="c-ln"><col></colgroup><thead><tr><th colspan="2">Original (base)</th><th colspan="2">Alterado (demanda)</th></tr></thead>` : `<colgroup><col class="c-ln"><col class="c-ln"><col class="c-sg"><col></colgroup>`;
+    view.innerHTML = (trunc ? '<div class="callout warn small">Arquivo muito grande: exibição truncada.</div>' : "") + (rows.length ? `<table class="cmp-tab ${CMP.mode}">${head}<tbody>${parts.join("")}</tbody></table>` : '<div class="small muted" style="padding:16px">Sem diferenças de conteúdo.</div>');
+    view.scrollTop = CMP.scroll;
+  };
+
+  const goChange = (dir) => {
+    if (!changeStarts.length) return;
+    curChange = (curChange + dir + changeStarts.length) % changeStarts.length;
+    const el = $(`#chg-${curChange}`, view);
+    if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("flash"); setTimeout(() => el.classList.remove("flash"), 900); }
+  };
+  view.addEventListener("scroll", () => { CMP.scroll = view.scrollTop; });
+  $$("[data-mode]", box).forEach((b) => b.addEventListener("click", () => { CMP.mode = b.dataset.mode; localStorage.setItem("devpipe.cmpMode", CMP.mode); $$("[data-mode]", box).forEach((x) => x.classList.toggle("on", x === b)); drawView(); }));
+  $("#cmp-only", box).addEventListener("change", (e) => { CMP.onlyChanges = e.target.checked; localStorage.setItem("devpipe.cmpOnly", CMP.onlyChanges ? "1" : "0"); drawView(); });
+  $("#cmp-prev", box).addEventListener("click", () => goChange(-1));
+  $("#cmp-next", box).addEventListener("click", () => goChange(1));
+  $("#cmp-full", box).addEventListener("click", () => { CMP.full = !CMP.full; $(".cmp", box).classList.toggle("full", CMP.full); });
+  $(".cmp-filter", box).addEventListener("input", (e) => { CMP.filter = e.target.value; drawTree(); });
+  box.addEventListener("keydown", (e) => { if (e.key === "F7") { e.preventDefault(); goChange(e.shiftKey ? -1 : 1); } if (e.key === "Escape" && CMP.full) { CMP.full = false; $(".cmp", box).classList.remove("full"); } });
+  box.tabIndex = -1;
+  drawTree();
+  await loadFile();
+}
+
 // ------------------------------------------------------------ dados
 async function loadBase() {
   [S.meta, S.projects, S.demands, S.settings] = await Promise.all([api("GET", "/api/meta"), api("GET", "/api/projects"), api("GET", "/api/demands"), api("GET", "/api/settings")]);
@@ -367,7 +535,7 @@ async function demandForm(det) {
         ${editing ? `<div class="kv" style="margin-bottom:12px"><dt>Projeto</dt><dd>${esc(d.projectName)}</dd></div>` : `
         <div class="seg" style="margin-bottom:10px"><button type="button" class="on" data-pmode="existing">Projeto cadastrado</button><button type="button" data-pmode="new">Novo caminho local</button></div>
         <div id="pm-existing"><label class="f"><span>Projeto de destino <em>*</em></span><select name="projectId">${S.projects.map((p) => `<option value="${p.id}" ${d.projectId === p.id ? "selected" : ""}>${esc(p.name)} — ${esc(p.path)}</option>`).join("") || `<option value="">Nenhum projeto cadastrado</option>`}</select></label></div>
-        <div id="pm-new" class="hidden"><label class="f"><span>Caminho absoluto do repositório</span><div class="row"><input type="text" name="newPath" placeholder="C:\\repos\\meu-sistema" class="grow" style="width:auto"><button type="button" class="btn" id="inspect-new">Validar</button></div></label>
+        <div id="pm-new" class="hidden"><label class="f"><span>Caminho absoluto da pasta do projeto (repositório Git ou pasta nova)</span><div class="row"><input type="text" name="newPath" placeholder="C:\\repos\\meu-sistema" class="grow" style="width:auto"><button type="button" class="btn" id="inspect-new">Validar</button></div></label>
           <label class="f"><span>Nome do projeto</span><input type="text" name="newName"></label></div>`}
         <div id="branch-box"></div>
         <label class="check"><input type="checkbox" name="reviewSpec" ${d.reviewSpec ? "checked" : ""}><span>Revisar a especificação gerada pela IA antes do desenvolvimento<br><span class="help">A esteira pausa em Planejamento até você aprovar.</span></span></label>
@@ -419,7 +587,12 @@ async function demandForm(det) {
         opts = S.projects.find((p) => p.id === pid)?.branchOptions || [];
       } else opts = info.suggestedOptions || [];
       current = info.current; branches = info.branches || [];
-      if (!info.valid) { box.innerHTML = `<div class="callout bad">⚠ ${esc(info.message)}</div>`; return; }
+      if (!info.valid) {
+        box.innerHTML = info.needsInit
+          ? `<div class="callout warn small">ℹ ${esc(info.message)}<br>A demanda vai trabalhar a partir da branch <b class="mono">main</b>.</div>`
+          : `<div class="callout bad">⚠ ${esc(info.message)}</div>`;
+        return;
+      }
     } catch (e) { box.innerHTML = `<div class="callout bad">⚠ ${esc(e.message)}</div>`; return; }
     const locked = editing && d.workBranch;
     const sel = d.baseBranch || "";
@@ -445,7 +618,7 @@ async function demandForm(det) {
   form.projectId?.addEventListener("change", () => loadBranches());
   $("#inspect-new")?.addEventListener("click", async () => {
     const info = await guarded(() => api("POST", "/api/projects/inspect", { path: form.newPath.value }));
-    if (info.valid && !form.newName.value) form.newName.value = info.path.split(/[\\/]/).pop();
+    if ((info.valid || info.needsInit) && !form.newName.value) form.newName.value = info.path.split(/[\\/]/).pop();
     loadBranches(info);
   });
   loadBranches();
@@ -530,8 +703,9 @@ VIEWS.demanda = async (r, soft) => {
   } else if (tab === "execucoes") {
     body = det.runs.length ? det.runs.map((x) => runHTML(x, false)).join("") : emptyState("Sem execuções", "");
   } else if (tab === "diff") {
-    const df = await api("GET", `/api/demands/${d.id}/diff`);
-    body = df.diff === "" && df.message ? `<div class="callout info">${esc(df.message)}</div>` : `<div class="panel"><div class="callout info small">Branch <b class="mono">${esc(df.branch)}</b> comparada com <b class="mono">${esc(df.base)}</b>. Worktree: <span class="mono">${esc(df.worktree)}</span>. Merge e push são sempre manuais.</div><div class="row" style="margin-bottom:8px"><span class="grow"></span>${!["executando", "na_fila"].includes(d.status) ? `<button class="btn sm" data-act="repair-enc" data-id="${d.id}">Ꞩ Reparar acentuação / codificação</button>` : ""}</div><pre class="mono small muted">${esc(df.stat)}</pre>${renderDiff(df.diff)}</div>`;
+    const df = await api("GET", `/api/demands/${d.id}/diff/files`);
+    body = df.message ? `<div class="callout info">${esc(df.message)}</div>` : `<div class="row small muted" style="margin-bottom:8px;gap:12px"><span>Branch <b class="mono">${esc(df.branch)}</b> comparada com <b class="mono">${esc(df.base)}</b> · área de trabalho <span class="mono">${esc(df.worktree)}</span></span><span class="grow"></span>${!["executando", "na_fila"].includes(d.status) ? `<button class="btn sm" data-act="repair-enc" data-id="${d.id}">Ꞩ Reparar acentuação / codificação</button>` : ""}</div><div id="cmp"></div>`;
+    pendingCmp = { d, files: df.files };
   } else if (tab === "log") {
     body = `<div class="panel"><div class="feed tall" id="dfeed"></div></div>`;
   }
@@ -549,6 +723,7 @@ VIEWS.demanda = async (r, soft) => {
   <div class="tabs">${tabs.map(([k, l]) => `<button class="${tab === k ? "on" : ""}" data-tab="${k}">${l}</button>`).join("")}</div>
   <div id="tabbody">${body}</div>`;
   $$("[data-tab]").forEach((b) => b.addEventListener("click", () => { location.hash = `#/demandas/${d.id}/${b.dataset.tab}`; }));
+  if (pendingCmp && $("#cmp")) { const p = pendingCmp; pendingCmp = null; mountComparator($("#cmp"), p.d, p.files); }
   const feed = $("#dfeed");
   if (feed) {
     const evs = await api("GET", `/api/events?demand=${d.id}&limit=${tab === "log" ? 2000 : 60}`);
@@ -633,7 +808,7 @@ VIEWS.projetos = async (r) => {
       ${S.projects.length ? `<table class="list"><tr><th>Projeto</th><th>Stack</th><th>Validação</th><th></th></tr>${S.projects.map((x) => `<tr><td><b>${esc(x.name)}</b><div class="mono small dim">${esc(x.path)}</div></td><td class="small">${esc(x.language || "—")}<div class="dim">${esc(x.mainSolution)}</div></td><td class="small mono">${esc(x.buildCommand || "—")}<br>${esc(x.testCommand || "")}</td><td><a class="btn sm" href="#/projetos/${x.id}">Editar</a></td></tr>`).join("")}</table>` : emptyState("Nenhum projeto", " Cadastre ao lado o caminho de um repositório Git.")}
     </div>
     <form class="panel hud" id="pform" autocomplete="off"><h2>${editing ? "Editar projeto" : "Novo projeto"}</h2>
-      <label class="f"><span>Caminho absoluto do repositório <em>*</em></span><div class="row"><input type="text" name="path" value="${esc(p.path)}" placeholder="C:\\repos\\sistema" class="grow" style="width:auto" required><button type="button" class="btn" id="pinspect">Validar e detectar</button></div></label>
+      <label class="f"><span>Caminho absoluto da pasta do projeto <em>*</em> <span class="help">(se ainda não for um repositório Git, o DevPipe cria um local)</span></span><div class="row"><input type="text" name="path" value="${esc(p.path)}" placeholder="C:\\repos\\sistema" class="grow" style="width:auto" required><button type="button" class="btn" id="pinspect">Validar e detectar</button></div></label>
       <div id="pinfo"></div>
       <div class="grid g2" style="gap:10px"><label class="f"><span>Nome <em>*</em></span><input type="text" name="name" value="${esc(p.name)}" required></label>
         <label class="f"><span>Linguagem predominante</span><input type="text" name="language" value="${esc(p.language)}"></label></div>
@@ -654,8 +829,8 @@ VIEWS.projetos = async (r) => {
   const f = $("#pform");
   const inspect = async () => {
     const info = await guarded(() => api("POST", "/api/projects/inspect", { path: f.path.value }));
-    $("#pinfo").innerHTML = `<div class="callout ${info.valid ? (info.authorized ? "good" : "warn") : "bad"} small">${info.valid ? "✔" : "⚠"} <div>${esc(info.message)}${info.valid ? `<br>Branch atual: <b class="mono">${esc(info.current)}</b> · ${info.branches.length} branches · ${info.dirty} alteração(ões) locais${info.standardsFound?.length ? `<br>Arquivos de padrões encontrados: ${info.standardsFound.map(esc).join(", ")}` : ""}` : ""}</div></div>`;
-    if (info.valid) {
+    $("#pinfo").innerHTML = `<div class="callout ${info.valid ? (info.authorized ? "good" : "warn") : info.needsInit ? "warn" : "bad"} small">${info.valid ? "✔" : info.needsInit ? "ℹ" : "⚠"} <div>${esc(info.message)}${info.valid ? `<br>Branch atual: <b class="mono">${esc(info.current)}</b> · ${info.branches.length} branches · ${info.dirty} alteração(ões) locais${info.standardsFound?.length ? `<br>Arquivos de padrões encontrados: ${info.standardsFound.map(esc).join(", ")}` : ""}` : ""}</div></div>`;
+    if (info.valid || info.needsInit) {
       if (!f.name.value) f.name.value = info.path.split(/[\\/]/).pop();
       if (!f.language.value) f.language.value = info.language || "";
       if (!f.mainSolution.value) f.mainSolution.value = info.solution || "";

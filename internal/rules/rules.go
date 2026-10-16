@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"devpipe/internal/domain"
+	"devpipe/internal/textx"
 )
 
 // Precedence é explicada ao agente literalmente.
@@ -60,7 +62,7 @@ func Compose(all []domain.Rule, p domain.Project, standardsRoot string) Composed
 			if len(scope) > 0 {
 				b.WriteString("_Aplica-se somente a " + strings.Join(scope, "; ") + "_\n")
 			}
-			b.WriteString(strings.TrimSpace(r.Content) + "\n\n")
+			b.WriteString(textx.Compact(r.Content) + "\n\n")
 		}
 	}
 	section("2. Regras globais OBRIGATÓRIAS", func(r domain.Rule) bool { return r.Scope == "global" && r.Mandatory })
@@ -68,7 +70,7 @@ func Compose(all []domain.Rule, p domain.Project, standardsRoot string) Composed
 	section("4. Regras do projeto", func(r domain.Rule) bool { return r.Scope == "projeto" && r.ProjectID == p.ID && !r.Mandatory })
 
 	if strings.TrimSpace(p.ExtraRules) != "" {
-		b.WriteString("#### Regras adicionais do cadastro do projeto\n" + strings.TrimSpace(p.ExtraRules) + "\n\n")
+		b.WriteString("#### Regras adicionais do cadastro do projeto\n" + textx.Compact(p.ExtraRules) + "\n\n")
 	}
 	for _, f := range p.StandardsFiles {
 		f = strings.TrimSpace(f)
@@ -86,10 +88,11 @@ func Compose(all []domain.Rule, p domain.Project, standardsRoot string) Composed
 			b.WriteString("#### Arquivo de padrões não encontrado: " + f + "\n\n")
 			continue
 		}
-		if len(data) > 60<<10 {
-			data = append(data[:60<<10], []byte("\n…(truncado)")...)
+		txt := compactStandards(string(data))
+		if len(txt) > 40<<10 {
+			txt = txt[:40<<10] + "\n…(truncado; leia o arquivo " + f + " se precisar do restante)"
 		}
-		b.WriteString("#### Arquivo de padrões do projeto: " + f + "\n" + string(data) + "\n\n")
+		b.WriteString("#### Arquivo de padrões do projeto: " + f + "\n" + txt + "\n\n")
 	}
 	section("5. Regras globais recomendadas", func(r domain.Rule) bool { return r.Scope == "global" && !r.Mandatory })
 
@@ -103,4 +106,19 @@ func ruleRef(r domain.Rule) string {
 		return fmt.Sprintf("G%d", r.ID)
 	}
 	return fmt.Sprintf("P%d", r.ID)
+}
+
+var (
+	htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+	mdImageRe     = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+	badgeLineRe   = regexp.MustCompile(`(?m)^\s*(\[!\[[^\n]*|<img [^\n]*>|<p align[^\n]*>|</p>)\s*$`)
+)
+
+// compactStandards remove de arquivos de padrões o que não orienta o agente
+// (comentários HTML, imagens, badges) e normaliza espaços em branco.
+func compactStandards(s string) string {
+	s = htmlCommentRe.ReplaceAllString(s, "")
+	s = badgeLineRe.ReplaceAllString(s, "")
+	s = mdImageRe.ReplaceAllString(s, "")
+	return textx.Compact(s)
 }

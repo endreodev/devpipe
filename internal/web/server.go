@@ -35,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.2.3"
+const Version = "0.2.6"
 
 type Server struct {
 	st      *store.Store
@@ -112,6 +112,8 @@ func (s *Server) Handler() http.Handler {
 	h("POST /api/demands/{id}/adjust", s.adjust)
 	h("POST /api/demands/{id}/move", s.move)
 	h("GET /api/demands/{id}/diff", s.diff)
+	h("GET /api/demands/{id}/diff/files", s.diffFiles)
+	h("GET /api/demands/{id}/diff/file", s.diffFile)
 	h("POST /api/demands/{id}/repair-encoding", func(w http.ResponseWriter, r *http.Request) (any, error) {
 		rep, err := s.eng.RepairEncoding(pid(r))
 		if err != nil {
@@ -236,6 +238,9 @@ type inspectResult struct {
 	Dirty      int               `json:"dirty"`
 	Authorized bool              `json:"authorized"`
 	Standards  []string          `json:"standardsFound"`
+	// NeedsInit: a pasta não existe ou ainda não é um repositório Git. O
+	// projeto pode ser salvo mesmo assim: o DevPipe cria um repositório local.
+	NeedsInit bool `json:"needsInit"`
 }
 
 func (s *Server) inspect(path string) inspectResult {
@@ -246,6 +251,26 @@ func (s *Server) inspect(path string) inspectResult {
 	top, err := repo.Validate()
 	if err != nil {
 		res.Message = err.Error()
+		if gitx.Available() != nil {
+			res.Message = "Git não encontrado no PATH. Instale o Git (git-scm.com) para usar o DevPipe."
+			return res
+		}
+		if !filepath.IsAbs(path) {
+			return res
+		}
+		res.NeedsInit, res.Path = true, filepath.Clean(path)
+		if st, e := os.Stat(path); e == nil && st.IsDir() {
+			res.Language, res.Solution = gitx.DetectStack(path)
+			res.Message = "A pasta ainda não é um repositório Git. Ao salvar, o DevPipe cria um repositório local (branch main, sem remoto) com os arquivos que já estão nela."
+		} else if e == nil {
+			res.NeedsInit = false
+			res.Message = "O caminho aponta para um arquivo, não para uma pasta."
+		} else {
+			res.Message = "A pasta ainda não existe. Ao salvar, o DevPipe cria a pasta e um repositório Git local (branch main, sem remoto)."
+		}
+		if !res.Authorized {
+			res.Message += " — ATENÇÃO: fora dos diretórios autorizados"
+		}
 		return res
 	}
 	res.Valid, res.Path = true, top
@@ -273,6 +298,31 @@ func (s *Server) inspect(path string) inspectResult {
 	return res
 }
 
+// ensureRepo valida o caminho do projeto e, se a pasta ainda não for um
+// repositório Git (ou nem existir), cria um repositório local. Só atua dentro
+// dos diretórios autorizados.
+func (s *Server) ensureRepo(path string) (inspectResult, error) {
+	ins := s.inspect(path)
+	if !ins.Authorized {
+		return ins, errors.New("o caminho não está dentro dos diretórios autorizados (Configurações > Segurança)")
+	}
+	if ins.Valid {
+		return ins, nil
+	}
+	if !ins.NeedsInit {
+		return ins, errors.New(ins.Message)
+	}
+	if _, err := (gitx.Repo{Dir: ins.Path}).Init(); err != nil {
+		return ins, fmt.Errorf("não foi possível criar o repositório Git em %s: %w", ins.Path, err)
+	}
+	s.eng.SystemLog(domain.LevelOK, "git", "Repositório Git local criado para o projeto em "+ins.Path+" (branch main, sem remoto)")
+	ins = s.inspect(ins.Path)
+	if !ins.Valid {
+		return ins, errors.New(ins.Message)
+	}
+	return ins, nil
+}
+
 func (s *Server) inspectProject(w http.ResponseWriter, r *http.Request) (any, error) {
 	var in struct{ Path string }
 	if err := decode(r, &in); err != nil {
@@ -297,12 +347,14 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) (any, error
 	if !filepath.IsAbs(p.Path) {
 		return nil, errors.New("informe o caminho absoluto do repositório")
 	}
-	ins := s.inspect(p.Path)
-	if !ins.Authorized {
-		return nil, errors.New("o caminho não está dentro dos diretórios autorizados (Configurações > Segurança)")
+	for _, c := range []string{p.BuildCommand, p.TestCommand} { // valida antes de criar qualquer coisa no disco
+		if err := security.CheckValidationCommand(c); err != nil {
+			return nil, err
+		}
 	}
-	if !ins.Valid {
-		return nil, errors.New(ins.Message)
+	ins, err := s.ensureRepo(p.Path)
+	if err != nil {
+		return nil, err
 	}
 	p.Path = ins.Path
 	for _, c := range []string{p.BuildCommand, p.TestCommand} {
@@ -386,9 +438,12 @@ func (s *Server) createDemand(w http.ResponseWriter, r *http.Request) (any, erro
 		if name == "" {
 			name = filepath.Base(in.NewProject.Path)
 		}
-		ins := s.inspect(in.NewProject.Path)
-		if !ins.Valid || !ins.Authorized {
-			return nil, fmt.Errorf("novo projeto inválido: %s", ins.Message)
+		if !filepath.IsAbs(strings.TrimSpace(in.NewProject.Path)) {
+			return nil, errors.New("novo projeto inválido: informe o caminho absoluto da pasta")
+		}
+		ins, err := s.ensureRepo(strings.TrimSpace(in.NewProject.Path))
+		if err != nil {
+			return nil, fmt.Errorf("novo projeto inválido: %w", err)
 		}
 		p := domain.Project{Name: name, Path: ins.Path, Language: ins.Language, MainSolution: ins.Solution, BranchOptions: ins.Suggested, AutoCommit: true}
 		if err := s.st.SaveProject(&p); err != nil {
@@ -685,6 +740,77 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) (any, error) {
 	repo := gitx.Repo{Dir: d.WorktreePath}
 	return map[string]string{"diff": security.Redact(displayText(repo.Diff(d.DiffBase(), 400<<10))), "stat": repo.DiffStat(d.DiffBase()),
 		"branch": d.WorkBranch, "base": d.BaseBranch, "worktree": d.WorktreePath}, nil
+}
+
+// diffRepo resolve a worktree da demanda para o comparador.
+func (s *Server) diffRepo(r *http.Request) (domain.Demand, gitx.Repo, string, error) {
+	d, err := s.st.GetDemand(pid(r))
+	if err != nil {
+		return d, gitx.Repo{}, "", err
+	}
+	if d.WorktreePath == "" || d.DiffBase() == "" {
+		return d, gitx.Repo{}, "A área de trabalho da demanda ainda não foi criada.", nil
+	}
+	if _, err := os.Stat(d.WorktreePath); err != nil {
+		return d, gitx.Repo{}, "Worktree não encontrada: " + d.WorktreePath, nil
+	}
+	return d, gitx.Repo{Dir: d.WorktreePath}, "", nil
+}
+
+func (s *Server) diffFiles(w http.ResponseWriter, r *http.Request) (any, error) {
+	d, repo, msg, err := s.diffRepo(r)
+	if err != nil || msg != "" {
+		return map[string]any{"files": []any{}, "message": msg}, err
+	}
+	files, err := repo.DiffFiles(d.DiffBase())
+	if err != nil {
+		return nil, err
+	}
+	if files == nil {
+		files = []gitx.FileChange{}
+	}
+	base := d.BaseBranch
+	if d.DirectBranch && d.BaseCommit != "" {
+		base = d.WorkBranch + " @ " + d.BaseCommit[:min(10, len(d.BaseCommit))]
+	}
+	return map[string]any{"files": files, "branch": d.WorkBranch, "base": base, "worktree": d.WorktreePath, "direct": d.DirectBranch}, nil
+}
+
+func (s *Server) diffFile(w http.ResponseWriter, r *http.Request) (any, error) {
+	d, repo, msg, err := s.diffRepo(r)
+	if err != nil {
+		return nil, err
+	}
+	if msg != "" {
+		return nil, errors.New(msg)
+	}
+	path := r.URL.Query().Get("path")
+	files, err := repo.DiffFiles(d.DiffBase())
+	if err != nil {
+		return nil, err
+	}
+	var fc *gitx.FileChange
+	for i := range files {
+		if files[i].Path == path {
+			fc = &files[i]
+		}
+	}
+	if fc == nil {
+		return nil, errors.New("arquivo não faz parte das alterações da demanda")
+	}
+	if fc.Binary {
+		return map[string]any{"file": fc, "binary": true, "diff": ""}, nil
+	}
+	raw, err := repo.FileDiff(d.DiffBase(), path)
+	if err != nil {
+		return nil, err
+	}
+	const limite = 4 << 20
+	trunc := len(raw) > limite
+	if trunc {
+		raw = raw[:limite]
+	}
+	return map[string]any{"file": fc, "diff": security.Redact(displayText(string(raw))), "truncated": trunc}, nil
 }
 
 func (s *Server) reorder(w http.ResponseWriter, r *http.Request) (any, error) {

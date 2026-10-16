@@ -248,7 +248,11 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 	cmd.WaitDelay = 5 * time.Second
 	procx.Prepare(cmd)
 	prompt := req.Prompt
-	if req.SystemPrompt != "" {
+	if req.SystemPrompt != "" && req.ResumeSession == "" {
+		// a política já vai em --append-system-prompt; a cópia no prompt só é
+		// necessária na primeira mensagem da sessão (proteção contra wrappers
+		// que truncam argumentos). Em sessões continuadas ela já está no
+		// histórico — reenviar só consumiria tokens.
 		prompt = req.SystemPrompt + "\n\n" + prompt
 	}
 	cmd.Stdin = strings.NewReader(prompt) // prompt via stdin evita limite de linha de comando

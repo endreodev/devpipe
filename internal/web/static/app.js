@@ -589,7 +589,7 @@ async function demandForm(det) {
       current = info.current; branches = info.branches || [];
       if (!info.valid) {
         box.innerHTML = info.needsInit
-          ? `<div class="callout warn small">ℹ ${esc(info.message)}<br>A demanda vai trabalhar a partir da branch <b class="mono">main</b>.</div>`
+          ? `<div class="callout warn small">ℹ ${esc(info.message)}<br>A demanda vai trabalhar direto na branch <b class="mono">main</b>: ao aprovar a revisão, os arquivos são gravados nesta pasta.</div>`
           : `<div class="callout bad">⚠ ${esc(info.message)}</div>`;
         return;
       }

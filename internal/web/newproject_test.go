@@ -1,7 +1,9 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +49,36 @@ func TestSaveProjectWithoutRepo(t *testing.T) {
 	}
 	if _, err := os.Stat(fora); err == nil {
 		t.Fatal("não deveria criar pasta fora dos autorizados")
+	}
+}
+
+// Demanda com projeto novo em pasta sem Git: o resultado precisa ir para a
+// pasta indicada, então a demanda trabalha direto na branch main mesmo que o
+// formulário não envie directBranch (a opção não aparece nesse caso).
+func TestNewProjectDemandWorksDirectOnFolder(t *testing.T) {
+	h, repo := newTestServer(t)
+	root := filepath.Dir(repo)
+	criar := func(path string) map[string]any {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		data, _ := json.Marshal(map[string]any{"ticket": "N-1", "title": "Novo", "instructions": "criar",
+			"newProject": map[string]string{"path": path}})
+		mw.WriteField("data", string(data))
+		mw.Close()
+		w := do(h, "POST", "/api/demands", buf.Bytes(), map[string]string{"X-DevPipe": "1", "Content-Type": mw.FormDataContentType()})
+		if w.Code != 200 {
+			t.Fatalf("criar demanda em %s: %d %s", path, w.Code, w.Body)
+		}
+		var d map[string]any
+		json.Unmarshal(w.Body.Bytes(), &d)
+		return d
+	}
+	if d := criar(filepath.Join(root, "jogo-novo")); d["directBranch"] != true {
+		t.Fatalf("pasta sem Git: esperado directBranch=true, veio %v", d["directBranch"])
+	}
+	// pasta que já é repositório: respeita a escolha do formulário (aqui, ausente = false)
+	if d := criar(repo); d["directBranch"] != false {
+		t.Fatalf("repositório existente: esperado directBranch=false, veio %v", d["directBranch"])
 	}
 }
 

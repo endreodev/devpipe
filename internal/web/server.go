@@ -35,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.2.6"
+const Version = "0.2.7"
 
 type Server struct {
 	st      *store.Store
@@ -441,9 +441,17 @@ func (s *Server) createDemand(w http.ResponseWriter, r *http.Request) (any, erro
 		if !filepath.IsAbs(strings.TrimSpace(in.NewProject.Path)) {
 			return nil, errors.New("novo projeto inválido: informe o caminho absoluto da pasta")
 		}
-		ins, err := s.ensureRepo(strings.TrimSpace(in.NewProject.Path))
+		path := strings.TrimSpace(in.NewProject.Path)
+		pastaSemGit := s.inspect(path).NeedsInit
+		ins, err := s.ensureRepo(path)
 		if err != nil {
 			return nil, fmt.Errorf("novo projeto inválido: %w", err)
+		}
+		if pastaSemGit {
+			// Projeto criado do zero: a pasta indicada é o destino dos arquivos.
+			// A demanda trabalha direto na branch main (sem branch devpipe/...)
+			// e, ao aprovar a revisão, as alterações são gravadas na própria pasta.
+			d.DirectBranch = true
 		}
 		p := domain.Project{Name: name, Path: ins.Path, Language: ins.Language, MainSolution: ins.Solution, BranchOptions: ins.Suggested, AutoCommit: true}
 		if err := s.st.SaveProject(&p); err != nil {

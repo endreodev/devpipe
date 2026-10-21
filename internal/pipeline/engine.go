@@ -900,8 +900,9 @@ func (e *Engine) prepareDirect(rs *runState, main gitx.Repo, wt string) error {
 //   - se a branch estiver em checkout (ex.: aberta no Visual Studio), aplica as
 //     alterações nos arquivos como ALTERAÇÕES PENDENTES (aparecem no Git
 //     Changes para você revisar e commitar). Não faz commit, não mexe no índice
-//     nem em outros arquivos; se algum trecho conflitar com alterações locais,
-//     nada é aplicado e o patch é salvo para aplicação manual;
+//     nem em outros arquivos; se houver alterações locais nos mesmos
+//     arquivos, aplica mesmo assim com merge de 3 vias (trechos que conflitam
+//     ficam com marcação de conflito no arquivo, para resolver no VS);
 //   - se a branch não estiver em checkout, cria o commit e avança a branch por
 //     fast-forward.
 func (e *Engine) ApplyToBranch(id int64) (string, error) {
@@ -958,16 +959,39 @@ func (e *Engine) ApplyToBranch(id int64) (string, error) {
 		return "", fmt.Errorf("o checkout %s não está na branch %s", dir, d.WorkBranch)
 	}
 	ja, err := (gitx.Repo{Dir: dir}).ApplyPatchToWorkingTree(patchPath)
-	if err != nil {
-		e.log(d, 0, domain.LevelWarn, "git", "As alterações NÃO foram aplicadas em "+dir+": conflitam com alterações locais nos mesmos trechos. Nada foi modificado.",
-			err.Error()+"\n\nPatch salvo em: "+patchPath+"\nPara aplicar com marcação de conflitos: git apply --3way \""+patchPath+"\"")
-		return "", fmt.Errorf("as alterações conflitam com mudanças locais no seu checkout (%s); nada foi modificado. Salve/commite ou desfaça as alterações locais nesses arquivos e clique em \"Aplicar na branch\" de novo. Patch salvo em %s", strings.Join(arquivos, ", "), patchPath)
-	}
-	if ja {
+	if err == nil && ja {
 		return "As alterações já estavam aplicadas no checkout " + dir + ".", nil
 	}
-	msg := fmt.Sprintf("%d arquivo(s) alterado(s) no seu checkout %s (branch %s) como alterações pendentes — revise no Git Changes e faça o commit.", len(arquivos), dir, d.WorkBranch)
-	e.log(d, 0, domain.LevelOK, "git", msg, strings.Join(arquivos, "\n"))
+	if err == nil {
+		msg := fmt.Sprintf("%d arquivo(s) alterado(s) no seu checkout %s (branch %s) como alterações pendentes — revise no Git Changes e faça o commit.", len(arquivos), dir, d.WorkBranch)
+		e.log(d, 0, domain.LevelOK, "git", msg, strings.Join(arquivos, "\n"))
+		return msg, nil
+	}
+	// O patch não aplica direto porque o checkout tem alterações locais nos
+	// mesmos arquivos: aplica mesmo assim, arquivo a arquivo, com merge de 3
+	// vias. O que não conflita é juntado; o que conflita fica marcado no arquivo.
+	res, merr := (gitx.Repo{Dir: dir}).MergeWorkingTreeFrom(wt, d.BaseCommit)
+	if merr != nil {
+		e.log(d, 0, domain.LevelError, "git", "Falha ao aplicar as alterações em "+dir, merr.Error()+"\n\nPatch salvo em: "+patchPath)
+		return "", fmt.Errorf("não foi possível aplicar as alterações no checkout %s: %v (patch salvo em %s)", dir, merr, patchPath)
+	}
+	if len(res.Changed)+len(res.Conflicts)+len(res.Kept) == 0 {
+		return "As alterações já estavam aplicadas no checkout " + dir + ".", nil
+	}
+	msg := fmt.Sprintf("%d arquivo(s) alterado(s) no seu checkout %s (branch %s) como alterações pendentes, junto com as suas alterações locais", len(res.Changed)+len(res.Conflicts), dir, d.WorkBranch)
+	if len(res.Conflicts) > 0 {
+		msg += fmt.Sprintf(". %d arquivo(s) ficaram com marcação de conflito (<<<<<<< / >>>>>>>) para você resolver no Visual Studio: %s", len(res.Conflicts), strings.Join(res.Conflicts, ", "))
+	}
+	if len(res.Kept) > 0 {
+		msg += ". Não alterados: " + strings.Join(res.Kept, "; ")
+	}
+	msg += " — revise no Git Changes e faça o commit."
+	nivel := domain.LevelOK
+	if len(res.Conflicts)+len(res.Kept) > 0 {
+		nivel = domain.LevelWarn
+	}
+	detalhe := "Alterados: " + strings.Join(res.Changed, "\n") + "\nCom conflito: " + strings.Join(res.Conflicts, "\n") + "\nMantidos: " + strings.Join(res.Kept, "\n") + "\n\nPatch salvo em: " + patchPath
+	e.log(d, 0, nivel, "git", msg, detalhe)
 	return msg, nil
 }
 

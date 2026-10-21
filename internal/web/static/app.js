@@ -94,6 +94,16 @@ function renderDiff(text) {
   }).join("") + "</div>";
 }
 
+// copia texto para a área de transferência (com fallback para contextos sem Clipboard API)
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch {
+    const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(ta); ta.select();
+    let ok = false; try { ok = document.execCommand("copy"); } catch {} ta.remove(); return ok;
+  }
+}
+
 // ------------------------------------------------------------ comparador (lado a lado / linha por linha)
 let pendingCmp = null;
 const CMP = { demandId: 0, file: "", mode: localStorage.getItem("devpipe.cmpMode") || "lado", onlyChanges: localStorage.getItem("devpipe.cmpOnly") === "1", collapsed: new Set(), filter: "", scroll: 0, full: false };
@@ -115,6 +125,7 @@ function parseFullDiff(text) {
     }
     if (line.startsWith("@@")) { flush(); const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line); if (m) { o = +m[1]; n = +m[2]; } continue; }
     const c = line[0], tx = line.slice(1).replace(/\r$/, "");
+    if (line.endsWith("\r")) rows.crlf = true;
     if (c === "-") dels.push({ n: o++, tx });
     else if (c === "+") adds.push({ n: n++, tx });
     else if (c === " ") { flush(); rows.push({ t: "c", l: { n: o++, tx }, r: { n: n++, tx } }); }
@@ -163,6 +174,7 @@ async function mountComparator(box, d, files) {
       <label class="small muted cmp-chk"><input type="checkbox" id="cmp-only" ${CMP.onlyChanges ? "checked" : ""}> Só trechos alterados</label>
       <div class="seg"><button data-mode="lado" class="${CMP.mode === "lado" ? "on" : ""}" title="Comparação lado a lado">◫ Lado a lado</button><button data-mode="linha" class="${CMP.mode === "linha" ? "on" : ""}" title="Linha por linha (unificado)">☰ Linha por linha</button></div>
       <button class="btn sm" id="cmp-prev" title="Alteração anterior (Shift+F7)">↑</button><button class="btn sm" id="cmp-next" title="Próxima alteração (F7)">↓</button>
+      <div class="seg"><button id="cmp-copy-l" title="Copiar o código ANTES (arquivo original completo)">⧉ Copiar antes</button><button id="cmp-copy-r" title="Copiar o código DEPOIS (arquivo alterado completo)">⧉ Copiar depois</button></div>
       <button class="btn sm" id="cmp-full" title="Tela cheia">⤢</button>
     </div>
     <div class="cmp-body"><div class="cmp-tree" id="cmp-tree"></div><div class="cmp-view" id="cmp-view"></div></div></div>`;
@@ -238,9 +250,23 @@ async function mountComparator(box, d, files) {
       }
     });
     gap();
-    const head = CMP.mode === "lado" ? `<colgroup><col class="c-ln"><col><col class="c-ln"><col></colgroup><thead><tr><th colspan="2">Original (base)</th><th colspan="2">Alterado (demanda)</th></tr></thead>` : `<colgroup><col class="c-ln"><col class="c-ln"><col class="c-sg"><col></colgroup>`;
+    const head = CMP.mode === "lado" ? `<colgroup><col class="c-ln"><col><col class="c-ln"><col></colgroup><thead><tr><th colspan="2"><span class="cmp-th">Original (base)<button class="cmp-cp" data-copy="l" title="Copiar o código antes">⧉ Copiar</button></span></th><th colspan="2"><span class="cmp-th">Alterado (demanda)<button class="cmp-cp" data-copy="r" title="Copiar o código depois">⧉ Copiar</button></span></th></tr></thead>` : `<colgroup><col class="c-ln"><col class="c-ln"><col class="c-sg"><col></colgroup>`;
     view.innerHTML = (trunc ? '<div class="callout warn small">Arquivo muito grande: exibição truncada.</div>' : "") + (rows.length ? `<table class="cmp-tab ${CMP.mode}">${head}<tbody>${parts.join("")}</tbody></table>` : '<div class="small muted" style="padding:16px">Sem diferenças de conteúdo.</div>');
     view.scrollTop = CMP.scroll;
+    $$("[data-copy]", view).forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); copySide(b.dataset.copy); }));
+    const hasL = rows.some((x) => x.l), hasR = rows.some((x) => x.r);
+    $("#cmp-copy-l", box).disabled = !hasL; $("#cmp-copy-r", box).disabled = !hasR;
+    $$('[data-copy="l"]', view).forEach((b) => (b.disabled = !hasL));
+    $$('[data-copy="r"]', view).forEach((b) => (b.disabled = !hasR));
+  };
+
+  // monta o arquivo completo de um lado ("l" = antes, "r" = depois) e copia
+  const copySide = async (side) => {
+    const lines = rows.filter((x) => x[side]).map((x) => x[side].tx);
+    const label = side === "l" ? "antes" : "depois";
+    if (!lines.length) { toast(`Não há código ${label} neste arquivo`, "err"); return; }
+    const ok = await copyText(lines.join(rows.crlf ? "\r\n" : "\n"));
+    toast(ok ? `Código ${label} copiado (${lines.length} linha${lines.length > 1 ? "s" : ""})` : "Não foi possível copiar", ok ? "ok" : "err");
   };
 
   const goChange = (dir) => {
@@ -254,6 +280,15 @@ async function mountComparator(box, d, files) {
   $("#cmp-only", box).addEventListener("change", (e) => { CMP.onlyChanges = e.target.checked; localStorage.setItem("devpipe.cmpOnly", CMP.onlyChanges ? "1" : "0"); drawView(); });
   $("#cmp-prev", box).addEventListener("click", () => goChange(-1));
   $("#cmp-next", box).addEventListener("click", () => goChange(1));
+  $("#cmp-copy-l", box).addEventListener("click", () => copySide("l"));
+  $("#cmp-copy-r", box).addEventListener("click", () => copySide("r"));
+  // lado a lado: ao selecionar com o mouse, limita a seleção à coluna clicada
+  view.addEventListener("mousedown", (e) => {
+    const t = $(".cmp-tab.lado", view); if (!t) return;
+    const td = e.target.closest("td.tx");
+    t.classList.remove("sel-l", "sel-r");
+    if (td) t.classList.add(td.cellIndex === 1 ? "sel-l" : "sel-r");
+  });
   $("#cmp-full", box).addEventListener("click", () => { CMP.full = !CMP.full; $(".cmp", box).classList.toggle("full", CMP.full); });
   $(".cmp-filter", box).addEventListener("input", (e) => { CMP.filter = e.target.value; drawTree(); });
   box.addEventListener("keydown", (e) => { if (e.key === "F7") { e.preventDefault(); goChange(e.shiftKey ? -1 : 1); } if (e.key === "Escape" && CMP.full) { CMP.full = false; $(".cmp", box).classList.remove("full"); } });

@@ -35,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.2.7"
+const Version = "0.2.8"
 
 type Server struct {
 	st      *store.Store

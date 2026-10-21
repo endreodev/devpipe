@@ -79,27 +79,29 @@ func TestDirectBranchCheckedOut(t *testing.T) {
 	}
 }
 
-// Conflito com alteração local no mesmo trecho: nada é alterado e a demanda
-// continua em Revisão.
+// Alteração local no mesmo arquivo/trecho: aplica mesmo assim (merge de 3
+// vias), deixando a marcação de conflito no arquivo, e a demanda é concluída.
 func TestDirectBranchConflict(t *testing.T) {
 	e, st, p := setup(t, fakeAgent)
+	headAntes := gitOut(t, p.Path, "rev-parse", "HEAD")
 	d := domain.Demand{Ticket: "CH-9", Title: "Conflito", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
 	st.CreateDemand(&d, "Criar feature.txt contendo ok")
 	e.Enqueue(d.ID)
 	waitFor(t, st, d.ID, emRevisao(e, 1))
 	os.WriteFile(filepath.Join(p.Path, "feature.txt"), []byte("meu\n"), 0o644)
-	if err := e.ApproveReview(d.ID, ""); err == nil || !strings.Contains(err.Error(), "conflitam") {
-		t.Fatalf("esperava conflito: %v", err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(p.Path, "feature.txt")); string(b) != "meu\n" {
-		t.Fatal("arquivo do usuário foi alterado")
-	}
-	if got, _ := st.GetDemand(d.ID); got.Stage != domain.StageReview {
-		t.Fatalf("deveria continuar em revisão: %s", got.Stage)
-	}
-	os.Remove(filepath.Join(p.Path, "feature.txt"))
 	if err := e.ApproveReview(d.ID, ""); err != nil {
-		t.Fatal(err)
+		t.Fatalf("deveria aplicar mesmo com alterações locais: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(p.Path, "feature.txt"))
+	if s := string(b); !strings.Contains(s, "<<<<<<<") || !strings.Contains(s, "meu") || !strings.Contains(s, "ok") {
+		t.Fatalf("esperava marcação de conflito com as duas versões: %q", s)
+	}
+	if gitOut(t, p.Path, "rev-parse", "HEAD") != headAntes {
+		t.Fatal("não deveria criar commit no checkout do usuário")
+	}
+	got, _ := st.GetDemand(d.ID)
+	if got.Stage != domain.StageDone || !strings.Contains(got.StatusMessage, "conflito") {
+		t.Fatalf("%s %s", got.Stage, got.StatusMessage)
 	}
 }
 

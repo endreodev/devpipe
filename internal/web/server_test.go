@@ -12,10 +12,13 @@ import (
 	"testing"
 
 	"devpipe/internal/domain"
+	"devpipe/internal/gittest"
 	"devpipe/internal/pipeline"
 	"devpipe/internal/provider"
 	"devpipe/internal/store"
 )
+
+func init() { gittest.SemAutoCRLF() }
 
 func newTestServer(t *testing.T) (http.Handler, string) {
 	tmp := t.TempDir()
@@ -37,6 +40,7 @@ func newTestServer(t *testing.T) (http.Handler, string) {
 	}
 	s := domain.DefaultSettings()
 	s.AuthorizedRoots = []string{filepath.Join(tmp, "repos")}
+	s.WorktreeRoot = filepath.Join(tmp, "worktrees") // hermético: nunca a raiz real da máquina
 	st.SaveSettings(s)
 	return New(st, eng, reg, tmp, 0).Handler(), repo
 }
@@ -93,7 +97,7 @@ func TestProjectAndDemandFlow(t *testing.T) {
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	data, _ := json.Marshal(map[string]any{"ticket": "T-1", "title": "Teste", "projectId": p.ID, "instructions": "fazer"})
+	data, _ := json.Marshal(map[string]any{"ticket": "T-1", "kind": domain.KindBug, "title": "Teste", "projectId": p.ID, "instructions": "fazer"})
 	mw.WriteField("data", string(data))
 	fw, _ := mw.CreateFormFile("files", "req.md")
 	fw.Write([]byte("# req"))
@@ -131,6 +135,39 @@ func TestProjectAndDemandFlow(t *testing.T) {
 }
 
 func itoa(i int64) string { b, _ := json.Marshal(i); return string(b) }
+
+// Uma execução ilegível no banco precisa virar erro na API: antes o erro era
+// descartado, a resposta saía com "runs": null e a tela quebrava no front.
+func TestGetDemandReportsRunsError(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := store.Open(filepath.Join(tmp, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg := provider.NewRegistry()
+	h := New(st, pipeline.New(st, reg, pipeline.NewBus(), tmp), reg, tmp, 0).Handler()
+	p := domain.Project{Name: "R", Path: filepath.Join(tmp, "r")}
+	if err := st.SaveProject(&p); err != nil {
+		t.Fatal(err)
+	}
+	d := domain.Demand{Ticket: "T-1", Title: "Teste", ProjectID: p.ID, Provider: "claude"}
+	if _, err := st.CreateDemand(&d, ""); err != nil {
+		t.Fatal(err)
+	}
+	run := domain.Run{DemandID: d.ID, RevisionNum: 1, Provider: "claude", Status: domain.StatusRunning, Stage: domain.StageAnalysis}
+	if err := st.CreateRun(&run); err != nil {
+		t.Fatal(err)
+	}
+	if w := do(h, "GET", "/api/demands/"+itoa(d.ID), nil, nil); w.Code != 200 || !bytes.Contains(w.Body.Bytes(), []byte(`"runs":[{`)) {
+		t.Fatalf("demanda íntegra: %d %s", w.Code, w.Body)
+	}
+	st.DB().Exec(`UPDATE runs SET started_at=char(0,0,0,0) WHERE id=?`, run.ID)
+	w := do(h, "GET", "/api/demands/"+itoa(d.ID), nil, nil)
+	if w.Code != 400 || !bytes.Contains(w.Body.Bytes(), []byte("execuções da demanda")) {
+		t.Fatalf("esperava erro das execuções, obtido %d %s", w.Code, w.Body)
+	}
+}
 
 func TestFazendaEndpoint(t *testing.T) {
 	h, _ := newTestServer(t)

@@ -44,13 +44,27 @@ Por que não as outras: **C#** seria a segunda melhor opção (especialmente se 
 1. **Cadastro** — demanda + revisão nº 1 (instruções originais) + anexos gravados em disco.
 2. **Fila** — o agendador escolhe por prioridade e ordem; no máximo `maxParallel` execuções e **uma por repositório**.
 3. **Análise + Planejamento** — anexos extraídos (texto delimitado como *dado não confiável*). O agente roda em **modo somente leitura** e devolve a especificação normalizada (objetivo, regras, critérios de aceite, arquivos afetados, dúvidas, pressupostos, plano). Opcionalmente a esteira **pausa para aprovação humana**.
-4. **Preparação** — a aplicação (não o agente) valida o repositório, resolve a branch base, avisa sobre alterações locais e cria/reutiliza a **worktree isolada** `dados/worktrees/p<projeto>/<id>-<ticket>` na branch `devpipe/<ticket>-<titulo>`.
+4. **Preparação** — a aplicação (não o agente) valida o repositório, resolve a branch base, avisa sobre alterações locais e cria/reutiliza a **worktree isolada** `dados/worktrees/p<projeto>/<id>-<ticket>` na branch de trabalho nomeada pela convenção da equipe (ver abaixo).
 5. **Desenvolvimento** — o agente edita arquivos na worktree com ferramentas restritas.
 6. **Validação** — a aplicação executa os comandos oficiais de build/teste. Se falhar, pede correção ao agente (retomando a mesma sessão) até N vezes. Se não houver comandos, registra explicitamente "validação não executada".
 7. **Revisão** — commit local na branch de trabalho (opcional), diff disponível, aguarda humano.
 
 > **Modo "direto na branch selecionada"** (opção da demanda, padrão a partir da v0.2.2): nenhuma branch nova é criada. A IA trabalha numa área de trabalho em **HEAD destacado** na ponta da branch escolhida (a branch não fica presa) e o commit inicial é guardado (`base_commit`, base do diff). **Ao aprovar** (ou pelo botão "Aplicar na branch"): se a branch estiver em checkout (ex.: aberta no Visual Studio), o patch da demanda é aplicado nos arquivos como **alterações pendentes** (aparecem no Git Changes; sem commit e sem mexer no índice); `git apply --check` antes — se conflitar com alterações locais, nada é alterado, a demanda continua em Revisão e o patch fica salvo em `dados/patches`. Se a branch não estiver em checkout, é feito commit e a branch avança só por fast-forward. Branch remota escolhida (ex.: `origin/release`) vira a branch local de acompanhamento de mesmo nome. Sem push.
 8. **Concluir** ou **Devolver para ajustes** — a devolução cria a revisão nº N com novas instruções/anexos; a nova análise recebe as especificações anteriores, o resumo da última implementação e o diff existente, e planeja **somente os ajustes**.
+
+### Convenção de nomes de branch
+
+A branch de trabalho segue o padrão da equipe:
+
+```
+<TIPO>/<TICKET>_Desenvolvimento      ex.: BUG/CH101010_Desenvolvimento
+```
+
+- **TIPO** vem do campo *Tipo* da demanda, obrigatório no cadastro: `BUG` (erro), `FIX` (chamado urgente), `NR` (novo requisito). É o primeiro segmento, então não pode mudar depois que a branch existe — a API recusa.
+- **TICKET** é usado **como foi digitado**; só os caracteres que o Git recusa em um nome de referência viram `-` (`gitx.sanitizeRefPart`). `CH101010`, `CH-101010` e `ch 101010` geram, respectivamente, `CH101010`, `CH-101010` e `ch-101010`.
+- **`_Desenvolvimento`** (`gitx.DevSuffix`) marca a branch em que a esteira desenvolve.
+
+A montagem está em `gitx.BranchName` e é verificada contra o próprio Git (`git check-ref-format`) em `TestBranchNameAceitaPeloGit`. Não existe mais prefixo por projeto: a convenção vale para todos. Demandas cadastradas antes dela ficam sem tipo e são recusadas na preparação com uma mensagem pedindo que o tipo seja escolhido — as que já têm branch continuam com o nome antigo.
 
 ### Progresso
 
@@ -83,17 +97,17 @@ Como a CLI é chamada:
 
 ## 4. Modelo de persistência (SQLite)
 
-Banco: `dados/devpipe.db` (WAL, chaves estrangeiras). Anexos e worktrees ficam no disco; o banco guarda metadados e caminhos.
+Banco: `dados/devpipe.db` (WAL, chaves estrangeiras; exige wazero ≥ 1.9.0 com Go 1.24+ — ver CLAUDE.md). Anexos e worktrees ficam no disco; o banco guarda metadados e caminhos.
 
 | Tabela | Conteúdo |
 |---|---|
-| `projects` | nome, caminho, linguagem, solução, atalhos de branch, arquivos de padrões, regras extras, comandos de build/teste, comandos liberados ao agente, prefixo de branch, commit automático |
-| `demands` | ticket, título, resumo, projeto, prioridade, ordem, observações, branch base/de trabalho, worktree, provedor, modelo, etapa, `blocked_from`, status, mensagem, progresso, tentativas, validação, revisão atual, última atividade, tempo acumulado |
+| `projects` | nome, caminho, linguagem, solução, atalhos de branch, arquivos de padrões, regras extras, comandos de build/teste, comandos liberados ao agente, commit automático |
+| `demands` | ticket, **tipo** (BUG/FIX/NR), título, resumo, projeto, prioridade, ordem, observações, branch base/de trabalho, worktree, provedor, modelo, etapa, `blocked_from`, status, mensagem, progresso, tentativas, validação, revisão atual, última atividade, tempo acumulado |
 | `revisions` | nº, tipo (original/ajuste), instruções, **especificação normalizada** (artefato separado do original), aprovada? |
 | `attachments` | arquivo original (caminho em disco), tipo, tamanho, caminho do texto extraído, nota de processamento |
 | `runs` | execução por tentativa: provedor, status, etapa, **hash e texto das regras usadas**, sessão do agente, resumo, erro, custo, diff-stat, commit |
 | `events` | log auditável: data/hora, demanda, ticket, projeto, execução, etapa, nível (info, aviso, erro, sucesso, agente, autorização), mensagem, detalhe |
-| `rules` / `rule_history` | regras globais/projeto, escopo por diretório/linguagem, obrigatória, prioridade, versão; histórico de cada versão |
+| `rules` / `rule_history` | regras globais/projeto, pasta de padrões externa + filtro, escopo por diretório/linguagem, obrigatória, prioridade, versão; histórico de cada versão |
 | `settings` | configuração geral (JSON) |
 | `schema_version` | controle de migrações |
 
@@ -102,11 +116,18 @@ Consultas por ticket, projeto, branch e período estão na API (`/api/demands?q=
 Pastas de dados:
 
 ```
-DevPipe/
+DevPipe/                                    (pasta de dados)
   devpipe.db, devpipe.log
   anexos/<demanda>/rev<n>/<arquivo> (+ .extraido.txt)
-  worktrees/p<projeto>/<demanda>-<ticket>/
+  patches/, codificacao/
+
+<raiz das áreas de trabalho>/               (Configurações > Áreas de trabalho)
+  p<projeto>/<demanda>-<ticket>/
 ```
+
+As áreas de trabalho ficam **fora** da pasta de dados: são cópias de repositórios inteiros, que não cabem no perfil do usuário. A raiz é configurável (`Settings.WorktreeRoot`) e vale para demandas novas — cada demanda guarda em `Demand.WorktreePath` o caminho que usou e continua nele. Padrão no Windows: `D:\repos\devpipe_demandas`.
+
+O texto integral das regras de cada execução (`runs.rules_text`) passa de 180 KB em projetos com pasta de padrões. Ele **não** entra na listagem de execuções: é carregado sob demanda por `GET /api/runs/{id}/rules` quando o usuário abre a auditoria. Carregá-lo em lote fazia a tela da demanda e as consultas internas do agendador arrastarem megabytes em páginas de overflow do SQLite.
 
 ## 5. Regras e precedência
 
@@ -116,6 +137,8 @@ DevPipe/
 4. Regras do projeto, regras adicionais do cadastro e arquivos de padrões do repositório.
 5. Regras globais recomendadas.
 6. Instruções da demanda (podem detalhar, nunca violar 1–3).
+
+Cada regra pode, além do texto, apontar uma **pasta de padrões** do computador (`source_dir`, com filtro `source_glob` — padrão `*.md; *.markdown; *.txt`). A pasta é lida **somente para leitura, a cada execução**: editar os arquivos já vale para a demanda seguinte, sem recadastro. Para não estourar o contexto valem os limites de `internal/rules/folder.go` (60 arquivos, 60 KB por arquivo, 160 KB por pasta, 8 níveis); pastas ocultas, `node_modules`, `bin`, `obj` e afins ficam de fora, e links simbólicos não são seguidos. Pasta ausente não interrompe a demanda: o prompt registra o aviso e segue com o texto da regra.
 
 O texto composto recebe um hash SHA-256 (16 caracteres) gravado em cada execução, junto com o texto integral — é possível auditar exatamente quais regras a IA recebeu.
 

@@ -1,0 +1,26 @@
+# Normalização de fim de linha.
+#
+# Sem isto, o checkout com core.autocrlf=true (padrão do Git for Windows)
+# deixa a árvore de trabalho em CRLF enquanto o repositório guarda LF: o
+# `git status` acusa centenas de arquivos "modificados" sem diferença de
+# conteúdo e o `gofmt -l` reprova 100% dos arquivos .go, o que anula a
+# verificação de formatação.
+#
+# Regra geral: tudo que é texto fica em LF no repositório E na árvore de
+# trabalho. As exceções são os scripts que o Windows executa.
+
+* text=auto eol=lf
+
+# Scripts executados pelo Windows: mantêm CRLF.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binários: nunca converter.
+*.docx binary
+*.wasm binary
+*.gz   binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.pdf  binary

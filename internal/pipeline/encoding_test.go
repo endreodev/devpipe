@@ -37,7 +37,7 @@ func TestEncodingIsPreservedThroughPipeline(t *testing.T) {
 	p.BuildCommand, p.TestCommand = "", ""
 	st.SaveProject(&p)
 
-	d := domain.Demand{Ticket: "ENC-1", Title: "acentuação", ProjectID: p.ID, Provider: "generico"}
+	d := domain.Demand{Ticket: "ENC-1", Kind: domain.KindBug, Title: "acentuação", ProjectID: p.ID, Provider: "generico"}
 	st.CreateDemand(&d, "x")
 	e.Enqueue(d.ID)
 	got := waitFor(t, st, d.ID, func(x domain.Demand) bool {

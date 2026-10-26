@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -81,8 +82,13 @@ func TestProjectDemandRevisionLifecycle(t *testing.T) {
 
 func TestRuleVersioningAndSettings(t *testing.T) {
 	s := newStore(t)
-	r := domain.Rule{Scope: "global", Title: "Nomes", Content: "PascalCase", Enabled: true}
+	r := domain.Rule{Scope: "global", Title: "Nomes", Content: "PascalCase", Enabled: true,
+		SourceDir: `C:\padroes`, SourceGlob: "*.md"}
 	s.SaveRule(&r)
+	rs, _ := s.ListRules(-1, false)
+	if len(rs) != 1 || rs[0].SourceDir != `C:\padroes` || rs[0].SourceGlob != "*.md" {
+		t.Fatalf("pasta de padrões não persistiu: %+v", rs)
+	}
 	r.Content = "PascalCase em classes"
 	s.SaveRule(&r)
 	if r.Version != 2 {
@@ -106,5 +112,56 @@ func TestSubscriptionOnlyDefaultsOnForOldSettings(t *testing.T) {
 	st, err := s.GetSettings()
 	if err != nil || !st.Claude.SubscriptionOnly {
 		t.Fatalf("esperava subscriptionOnly=true, obtido %+v %v", st.Claude, err)
+	}
+}
+
+// Regressão do runtime wasm: o wazero anterior ao 1.9.0, compilado com Go 1.24+
+// no amd64, corrompe registrador no memmove (tetratelabs/wazero#2378) e o
+// SQLite passa a ler/gravar memória errada — em produção, panics "out of bounds
+// memory access" e um parâmetro gravado por cima de outro no INSERT de runs.
+// Este caminho (WAL com índice no heap) caía sempre com o wazero 1.8.2.
+func TestWasmRuntimeSurvivesExclusiveWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=locking_mode(EXCLUSIVE)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db}
+	defer s.Close()
+	if err := s.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveProject(&domain.Project{Name: "Demo", Path: "/tmp/demo"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// O tipo da demanda vai e volta do banco: é ele que forma a branch.
+func TestDemandKindPersiste(t *testing.T) {
+	s := newStore(t)
+	p := domain.Project{Name: "P", Path: t.TempDir()}
+	if err := s.SaveProject(&p); err != nil {
+		t.Fatal(err)
+	}
+	d := domain.Demand{Ticket: "CH101010", Kind: domain.KindBug, Title: "x", ProjectID: p.ID}
+	if _, err := s.CreateDemand(&d, "i"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetDemand(d.ID)
+	if err != nil || got.Kind != domain.KindBug {
+		t.Fatalf("tipo não persistiu: %q (%v)", got.Kind, err)
+	}
+	got.Kind = domain.KindNR
+	if err := s.UpdateDemandFields(got); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := s.GetDemand(d.ID); again.Kind != domain.KindNR {
+		t.Fatalf("tipo não foi atualizado: %q", again.Kind)
+	}
+	// demandas gravadas antes da migração ficam sem tipo, e isso não quebra a leitura
+	s.DB().Exec(`UPDATE demands SET kind=NULL WHERE id=?`, d.ID)
+	if legada, err := s.GetDemand(d.ID); err != nil || legada.Kind != "" {
+		t.Fatalf("demanda legada: %q (%v)", legada.Kind, err)
 	}
 }

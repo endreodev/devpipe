@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"devpipe/internal/domain"
+	"devpipe/internal/gittest"
 	"devpipe/internal/provider"
 	"devpipe/internal/store"
 )
+
+func init() { gittest.SemAutoCRLF() }
 
 // fakeAgent simula um agente via provedor genérico (script de shell):
 // análise -> imprime especificação; desenvolvimento -> grava "ruim";
@@ -57,6 +60,7 @@ func setup(t *testing.T, agent string) (*Engine, *store.Store, domain.Project) {
 	t.Cleanup(func() { st.Close() })
 	s := domain.DefaultSettings()
 	s.DefaultProvider = "generico"
+	s.WorktreeRoot = filepath.Join(tmp, "worktrees") // hermético: nunca a raiz real da máquina
 	s.MaxFixAttempts = 2
 	st.SaveSettings(s)
 	reg := provider.NewRegistry()
@@ -93,7 +97,7 @@ func waitFor(t *testing.T, st *store.Store, id int64, cond func(domain.Demand) b
 
 func TestFullCycleWithFixAndAdjustment(t *testing.T) {
 	e, st, p := setup(t, fakeAgent)
-	d := domain.Demand{Ticket: "CH-42", Title: "Criar arquivo de feature", ProjectID: p.ID, Provider: "generico"}
+	d := domain.Demand{Ticket: "CH-42", Kind: domain.KindNR, Title: "Criar arquivo de feature", ProjectID: p.ID, Provider: "generico"}
 	if _, err := st.CreateDemand(&d, "Criar feature.txt contendo ok"); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +118,7 @@ func TestFullCycleWithFixAndAdjustment(t *testing.T) {
 	if got.Stage != domain.StageReview || got.ValidationState != "ok" {
 		t.Fatalf("esperava revisão com validação ok, obtido %s %s %s", got.Stage, got.ValidationState, got.StatusMessage)
 	}
-	if !strings.HasPrefix(got.WorkBranch, "devpipe/ch-42-criar-arquivo-de-feature") {
+	if got.WorkBranch != "NR/CH-42_Desenvolvimento" {
 		t.Fatalf("branch inesperada: %s", got.WorkBranch)
 	}
 	// checkout principal intacto, sem a feature
@@ -173,7 +177,7 @@ func TestFullCycleWithFixAndAdjustment(t *testing.T) {
 func TestValidationKeepsFailingBlocks(t *testing.T) {
 	agent := `case "$DEVPIPE_PHASE" in analise) printf '# Especificação — X\n## Objetivo\nx\n';; *) cat >/dev/null; echo ruim > feature.txt; echo tentei;; esac`
 	e, st, p := setup(t, agent)
-	d := domain.Demand{Ticket: "X-1", Title: "falha", ProjectID: p.ID, Provider: "generico"}
+	d := domain.Demand{Ticket: "X-1", Kind: domain.KindBug, Title: "falha", ProjectID: p.ID, Provider: "generico"}
 	st.CreateDemand(&d, "x")
 	e.Enqueue(d.ID)
 	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Stage == domain.StageBlocked && !e.IsRunning(x.ID) })
@@ -188,7 +192,7 @@ func TestValidationKeepsFailingBlocks(t *testing.T) {
 func TestSpecApprovalGateAndCancel(t *testing.T) {
 	agent := `case "$DEVPIPE_PHASE" in analise) printf '# Especificação — Y\n## Objetivo\ny\n';; *) cat >/dev/null; sleep 30;; esac`
 	e, st, p := setup(t, agent)
-	d := domain.Demand{Ticket: "Y-1", Title: "gate", ProjectID: p.ID, Provider: "generico", ReviewSpec: true}
+	d := domain.Demand{Ticket: "Y-1", Kind: domain.KindBug, Title: "gate", ProjectID: p.ID, Provider: "generico", ReviewSpec: true}
 	st.CreateDemand(&d, "y")
 	e.Enqueue(d.ID)
 	got := waitFor(t, st, d.ID, func(x domain.Demand) bool { return x.Status == domain.StatusAwaitingApproval && !e.IsRunning(x.ID) })
@@ -219,7 +223,7 @@ func TestRepoLockPreventsConcurrentWork(t *testing.T) {
 	st.SaveSettings(s)
 	var ids []int64
 	for _, tk := range []string{"A-1", "A-2"} {
-		d := domain.Demand{Ticket: tk, Title: tk, ProjectID: p.ID, Provider: "generico"}
+		d := domain.Demand{Ticket: tk, Kind: domain.KindBug, Title: tk, ProjectID: p.ID, Provider: "generico"}
 		st.CreateDemand(&d, "z")
 		ids = append(ids, d.ID)
 	}
@@ -238,4 +242,23 @@ func TestRepoLockPreventsConcurrentWork(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("demandas não concluíram")
+}
+
+func TestWorktreeRootConfiguravel(t *testing.T) {
+	e := &Engine{dataDir: filepath.FromSlash("/dados")}
+	p := domain.Project{ID: 7}
+	d := domain.Demand{ID: 42, Ticket: "CH-1"}
+	semRaiz := e.worktreePath(domain.Settings{}, p, d)
+	if !strings.Contains(semRaiz, filepath.Join("dados", "worktrees", "p7", "42-CH-1")) {
+		t.Fatalf("raiz vazia deveria usar a pasta de dados: %s", semRaiz)
+	}
+	comRaiz := e.worktreePath(domain.Settings{WorktreeRoot: filepath.FromSlash("/trabalho")}, p, d)
+	if !strings.Contains(comRaiz, filepath.Join("trabalho", "p7", "42-CH-1")) {
+		t.Fatalf("raiz configurada não foi usada: %s", comRaiz)
+	}
+	// demanda que já começou não muda de lugar
+	d.WorktreePath = filepath.FromSlash("/antigo/p7/42-CH-1")
+	if got := e.worktreePath(domain.Settings{WorktreeRoot: filepath.FromSlash("/trabalho")}, p, d); got != d.WorktreePath {
+		t.Fatalf("demanda existente deveria manter o caminho: %s", got)
+	}
 }

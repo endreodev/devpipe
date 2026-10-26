@@ -62,7 +62,12 @@ func Compose(all []domain.Rule, p domain.Project, standardsRoot string) Composed
 			if len(scope) > 0 {
 				b.WriteString("_Aplica-se somente a " + strings.Join(scope, "; ") + "_\n")
 			}
-			b.WriteString(textx.Compact(r.Content) + "\n\n")
+			if c := strings.TrimSpace(textx.Compact(r.Content)); c != "" {
+				b.WriteString(c + "\n\n")
+			}
+			if strings.TrimSpace(r.SourceDir) != "" {
+				writeFolder(&b, ReadFolder(r.SourceDir, r.SourceGlob))
+			}
 		}
 	}
 	section("2. Regras globais OBRIGATÓRIAS", func(r domain.Rule) bool { return r.Scope == "global" && r.Mandatory })

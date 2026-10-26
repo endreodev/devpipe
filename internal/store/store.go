@@ -32,7 +32,11 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
-func (s *Store) DB() *sql.DB  { return s.db }
+
+// DB expõe a conexão para os testes montarem estados que a API não produz
+// (linhas legadas, dados corrompidos). O código de produção não deve usá-la:
+// todo SQL fica neste pacote, para que a troca de banco seja local.
+func (s *Store) DB() *sql.DB { return s.db }
 
 // migrations: cada item é aplicado uma única vez (controle em schema_version).
 var migrations = []string{
@@ -170,6 +174,13 @@ var migrations = []string{
 	`ALTER TABLE projects ADD COLUMN file_encoding TEXT DEFAULT 'auto';`,
 	`ALTER TABLE demands ADD COLUMN direct_branch INTEGER DEFAULT 0;`,
 	`ALTER TABLE demands ADD COLUMN base_commit TEXT DEFAULT '';`,
+	`ALTER TABLE rules ADD COLUMN source_dir TEXT DEFAULT '';
+	 ALTER TABLE rules ADD COLUMN source_glob TEXT DEFAULT '';`,
+	// O agendador consulta as demandas na fila a cada 3 s (ver Engine.schedule).
+	`CREATE INDEX ix_demands_status ON demands(status, priority, queue_order);`,
+	// Tipo da demanda (BUG|FIX|NR): primeiro segmento da branch de trabalho.
+	// Demandas anteriores ficam com '' — a branch delas já existe.
+	`ALTER TABLE demands ADD COLUMN kind TEXT DEFAULT '';`,
 }
 
 func (s *Store) migrate() error {

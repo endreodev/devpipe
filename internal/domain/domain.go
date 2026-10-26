@@ -1,7 +1,10 @@
 // Package domain contém os tipos centrais da esteira (sem dependências externas).
 package domain
 
-import "time"
+import (
+	"runtime"
+	"time"
+)
 
 // Stage representa a etapa da esteira (coluna do Kanban).
 type Stage string
@@ -64,16 +67,41 @@ type Project struct {
 	BuildCommand   string    `json:"buildCommand"`
 	TestCommand    string    `json:"testCommand"`
 	AgentBashAllow []string  `json:"agentBashAllow"` // prefixos de comando liberados ao agente (ex.: "dotnet build")
-	BranchPrefix   string    `json:"branchPrefix"`
 	AutoCommit     bool      `json:"autoCommit"`
 	FileEncoding   string    `json:"fileEncoding"` // auto | windows-1252 | utf-8 | utf-8-bom (arquivos novos)
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
+// Tipo da demanda. Define o primeiro segmento da branch de trabalho
+// (ver gitx.BranchName) e é escolhido no cadastro.
+const (
+	KindBug = "BUG" // correção de erro
+	KindFix = "FIX" // chamado urgente
+	KindNR  = "NR"  // novo requisito
+)
+
+var KindLabels = map[string]string{
+	KindBug: "BUG — erro",
+	KindFix: "FIX — chamado urgente",
+	KindNR:  "NR — novo requisito",
+}
+
+// Kinds na ordem de exibição.
+var Kinds = []string{KindBug, KindFix, KindNR}
+
+// ValidKind diz se k é um tipo conhecido.
+func ValidKind(k string) bool {
+	_, ok := KindLabels[k]
+	return ok
+}
+
 type Demand struct {
-	ID          int64  `json:"id"`
-	Ticket      string `json:"ticket"`
+	ID     int64  `json:"id"`
+	Ticket string `json:"ticket"`
+	// Kind: BUG | FIX | NR. Obrigatório no cadastro — é o primeiro segmento
+	// da branch de trabalho, e branch errada não se corrige sozinha.
+	Kind        string `json:"kind"`
 	Title       string `json:"title"`
 	Summary     string `json:"summary"`
 	ProjectID   int64  `json:"projectId"`
@@ -186,30 +214,43 @@ type Event struct {
 }
 
 type Rule struct {
-	ID        int64     `json:"id"`
-	Scope     string    `json:"scope"` // global | projeto
-	ProjectID int64     `json:"projectId"`
-	Title     string    `json:"title"`
-	Category  string    `json:"category"`
-	Content   string    `json:"content"`
-	PathGlob  string    `json:"pathGlob"` // aplica-se a diretórios/arquivos (opcional)
-	Language  string    `json:"language"`
-	Mandatory bool      `json:"mandatory"`
-	Priority  int       `json:"priority"`
-	Enabled   bool      `json:"enabled"`
-	Version   int       `json:"version"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID        int64  `json:"id"`
+	Scope     string `json:"scope"` // global | projeto
+	ProjectID int64  `json:"projectId"`
+	Title     string `json:"title"`
+	Category  string `json:"category"`
+	Content   string `json:"content"`
+	// SourceDir: pasta de padrões fora do repositório (ex.: a pasta que a
+	// equipe já mantém para outras ferramentas). É lida a cada execução, então
+	// alterações nos arquivos valem na demanda seguinte sem recadastro.
+	// Vazio = a regra é apenas o texto de Content.
+	SourceDir string `json:"sourceDir"`
+	// SourceGlob: filtro dos arquivos da pasta (ex.: "*.md; backend/**").
+	// Vazio = arquivos de documentação (ver rules.DefaultFolderGlob).
+	SourceGlob string    `json:"sourceGlob"`
+	PathGlob   string    `json:"pathGlob"` // aplica-se a diretórios/arquivos (opcional)
+	Language   string    `json:"language"`
+	Mandatory  bool      `json:"mandatory"`
+	Priority   int       `json:"priority"`
+	Enabled    bool      `json:"enabled"`
+	Version    int       `json:"version"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // Settings gerais (persistidas como chave/valor JSON).
 type Settings struct {
-	AuthorizedRoots   []string        `json:"authorizedRoots"`
-	MaxParallel       int             `json:"maxParallel"`
-	DefaultProvider   string          `json:"defaultProvider"`
-	MaxFixAttempts    int             `json:"maxFixAttempts"`
-	CommandTimeoutMin int             `json:"commandTimeoutMin"`
-	AgentTimeoutMin   int             `json:"agentTimeoutMin"`
-	AutoStartQueue    bool            `json:"autoStartQueue"`
+	AuthorizedRoots   []string `json:"authorizedRoots"`
+	MaxParallel       int      `json:"maxParallel"`
+	DefaultProvider   string   `json:"defaultProvider"`
+	MaxFixAttempts    int      `json:"maxFixAttempts"`
+	CommandTimeoutMin int      `json:"commandTimeoutMin"`
+	AgentTimeoutMin   int      `json:"agentTimeoutMin"`
+	AutoStartQueue    bool     `json:"autoStartQueue"`
+	// WorktreeRoot: onde ficam as áreas de trabalho das demandas. Vazio = a
+	// subpasta "worktrees" da pasta de dados. Vale para demandas NOVAS: cada
+	// demanda guarda o caminho que usou (Demand.WorktreePath), então mudar
+	// aqui não move nada que já existe.
+	WorktreeRoot      string          `json:"worktreeRoot"`
 	CommitAuthorName  string          `json:"commitAuthorName"`  // autor dos commits automáticos (vazio = user.name do Git)
 	CommitAuthorEmail string          `json:"commitAuthorEmail"` // vazio = user.email do Git do repositório
 	Claude            ClaudeSettings  `json:"claude"`
@@ -235,11 +276,25 @@ type GenericSettings struct {
 	Command string `json:"command"` // executado no diretório da worktree; prompt via stdin
 }
 
+// DefaultWorktreeRoot é o destino das áreas de trabalho quando nada foi
+// configurado. No Windows aponta para o disco de trabalho (D:), fora da pasta
+// de dados em %AppData%: as worktrees são cópias de repositórios inteiros, não
+// cabem no perfil do usuário (que costuma ser sincronizado/ter cota) e ficam
+// no mesmo volume dos repositórios de origem. Em outros sistemas, vazio — a
+// pasta de dados é usada.
+func DefaultWorktreeRoot() string {
+	if runtime.GOOS == "windows" {
+		return `D:\repos\devpipe_demandas`
+	}
+	return ""
+}
+
 func DefaultSettings() Settings {
 	return Settings{
 		MaxParallel: 1, DefaultProvider: "claude", MaxFixAttempts: 2,
 		CommandTimeoutMin: 15, AgentTimeoutMin: 45, AutoStartQueue: true,
-		Claude:  ClaudeSettings{Enabled: true, Binary: "claude", PermissionMode: "acceptEdits", SubscriptionOnly: true},
-		Generic: GenericSettings{Name: "CLI genérico"},
+		WorktreeRoot: DefaultWorktreeRoot(),
+		Claude:       ClaudeSettings{Enabled: true, Binary: "claude", PermissionMode: "acceptEdits", SubscriptionOnly: true},
+		Generic:      GenericSettings{Name: "CLI genérico"},
 	}
 }

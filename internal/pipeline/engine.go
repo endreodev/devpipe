@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -79,8 +80,19 @@ func (e *Engine) AttachmentDir(demandID int64, rev int) string {
 	return filepath.Join(e.dataDir, "anexos", fmt.Sprint(demandID), fmt.Sprintf("rev%d", rev))
 }
 
-func (e *Engine) worktreePath(p domain.Project, d domain.Demand) string {
-	return filepath.Join(e.dataDir, "worktrees", fmt.Sprintf("p%d", p.ID), fmt.Sprintf("%d-%s", d.ID, sanitize(d.Ticket)))
+// worktreePath monta o caminho da área de trabalho de uma demanda. A raiz vem
+// das configurações (Configurações > Áreas de trabalho); vazia, cai na pasta
+// de dados. Demandas que já começaram guardam o caminho em Demand.WorktreePath
+// e continuam onde estão — mudar a raiz só vale para demandas novas.
+func (e *Engine) worktreePath(st domain.Settings, p domain.Project, d domain.Demand) string {
+	if d.WorktreePath != "" {
+		return d.WorktreePath
+	}
+	root := strings.TrimSpace(st.WorktreeRoot)
+	if root == "" {
+		root = filepath.Join(e.dataDir, "worktrees")
+	}
+	return filepath.Join(root, fmt.Sprintf("p%d", p.ID), fmt.Sprintf("%d-%s", d.ID, sanitize(d.Ticket)))
 }
 
 var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -162,14 +174,11 @@ func (e *Engine) schedule() {
 	if max < 1 {
 		max = 1
 	}
-	queued, err := e.st.ListDemands(store.DemandFilter{})
+	queued, err := e.st.ListDemands(store.DemandFilter{Status: domain.StatusQueued})
 	if err != nil {
 		return
 	}
 	for _, d := range queued {
-		if d.Status != domain.StatusQueued {
-			continue
-		}
 		p, err := e.st.GetProject(d.ProjectID)
 		if err != nil {
 			continue
@@ -195,7 +204,10 @@ func (e *Engine) schedule() {
 		go func(d domain.Demand) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("pânico na demanda %d: %v", d.ID, r)
+					// a pilha vai para o devpipe.log: sem ela, um pânico dentro
+					// do SQLite/wasm chega ao usuário como mensagem solta e não
+					// há como saber qual consulta o provocou.
+					log.Printf("pânico na demanda %d: %v\n%s", d.ID, r, debug.Stack())
 					cur, _ := e.st.GetDemand(d.ID)
 					e.block(&cur, nil, cur.Stage, fmt.Errorf("erro interno inesperado: %v", r))
 				}
@@ -276,7 +288,16 @@ type runState struct {
 	baseSecs  int64
 	encIssues []encx.Issue // problemas de codificação pendentes (viram falha de validação)
 	encSeq    int
+	lastSave  time.Time // última gravação do estado da demanda (ver activityInterval)
 }
+
+// activityInterval limita a gravação do campo "última atividade" enquanto o
+// agente trabalha. Cada ferramenta que o agente usa gera um evento; sem o
+// limite, uma demanda que lê 300 arquivos dispara 300 UPDATEs de 28 colunas na
+// conexão única do SQLite (SetMaxOpenConns(1)), concorrendo com as consultas da
+// interface. O evento em si continua indo para o banco e para o SSE a cada
+// ocorrência — o que é adiado é apenas o resumo exibido no cartão.
+const activityInterval = time.Second
 
 func (e *Engine) setStage(rs *runState, s domain.Stage, status, msg string) {
 	d := rs.d
@@ -284,6 +305,7 @@ func (e *Engine) setStage(rs *runState, s domain.Stage, status, msg string) {
 	d.Progress = progressFor(s, d.Progress)
 	d.ElapsedSeconds = rs.baseSecs + int64(time.Since(rs.started).Seconds())
 	e.touch(d, msg)
+	rs.lastSave = time.Now()
 	e.save(d)
 	if rs.run != nil {
 		rs.run.Stage = s
@@ -360,7 +382,7 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		return
 	}
 
-	wt := e.worktreePath(p, d)
+	wt := e.worktreePath(settings, p, d)
 	wtExists := dirExists(wt)
 	standardsRoot := p.Path
 	if wtExists {
@@ -430,19 +452,19 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 			return
 		}
 		pc.D = d
-		aman, apath := e.encPrepare(rs, wt, prov)
-		actx, cancel := context.WithTimeout(ctx, agentTimeout)
-		res, err := prov.Run(actx, provider.Request{Phase: provider.PhaseAnalysis, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
-			Prompt: analysisPrompt(pc), ExtraReadDirs: attDirs, Model: d.Model, EncodingManifest: apath}, e.agentEmitter(rs))
-		cancel()
-		if err != nil || d.ReviewSpec || apath == "" {
-			e.encRestore(rs, p, wt, aman, apath)
-			rs.encIssues = nil // análise é somente leitura
-		} else {
-			pendingEnc = apath // o desenvolvimento continua com os mesmos arquivos já convertidos
+		res, kept, err := e.runAgent(ctx, rs, agentRun{
+			prov: prov, proj: p, workDir: wt, phase: provider.PhaseAnalysis,
+			model: d.Model, timeout: agentTimeout, readDirs: attDirs,
+			prompt: func(bool) string { return analysisPrompt(pc) },
+			// Sem aprovação humana pendente, o desenvolvimento continua a mesma
+			// sessão e reaproveita os arquivos já convertidos.
+			keep: func(_ provider.Result, err error) bool { return err == nil && !d.ReviewSpec },
+		})
+		pendingEnc = kept
+		if kept == "" {
+			rs.encIssues = nil // a análise é somente leitura: não gera problema de codificação
 		}
 		analysisSession = res.SessionID
-		run.CostUSD += res.CostUSD
 		if err != nil {
 			fail(domain.StageAnalysis, fmt.Errorf("análise falhou: %w", err))
 			return
@@ -511,36 +533,19 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		e.encRestore(rs, p, wt, nil, "") // repara branches afetadas por versões anteriores
 	} else {
 		e.setStage(rs, domain.StageDev, domain.StatusRunning, "IA implementando as alterações")
-		man, mpath := e.encPrepare(rs, wt, prov)
-		if pendingEnc != "" && mpath != "" {
-			mpath, pendingEnc = pendingEnc, ""
-		}
-		pc.EncodingNote = encodingNote(man, mpath != "")
 		if analysisSession != "" {
 			e.log(d, run.ID, domain.LevelInfo, "sessao", "Desenvolvimento continua a sessão da análise (o agente já conhece os arquivos analisados)", "")
 		}
-		dctx, cancel := context.WithTimeout(ctx, agentTimeout)
-		pc.Resumed = analysisSession != "" // sessão continuada: não reenvia regras/especificação
-		res, err := prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
-			Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
-			ResumeSession: analysisSession, EncodingManifest: mpath}, e.agentEmitter(rs))
-		cancel()
-		if err != nil && analysisSession != "" && res.SessionID == "" && ctx.Err() == nil {
-			var lim *provider.ErrPlanLimit
-			var pol *provider.ErrPolicy
-			if !errors.As(err, &lim) && !errors.As(err, &pol) {
-				// sessão anterior indisponível: nova sessão do zero
-				e.log(d, run.ID, domain.LevelWarn, "sessao", "Não foi possível continuar a sessão da análise; iniciando nova sessão", err.Error())
-				dctx, cancel = context.WithTimeout(ctx, agentTimeout)
-				pc.Resumed = false // sessão nova: precisa do contexto completo
-				res, err = prov.Run(dctx, provider.Request{Phase: provider.PhaseDevelop, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
-					Prompt: developPrompt(pc, rev.Spec), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
-					EncodingManifest: mpath}, e.agentEmitter(rs))
-				cancel()
-			}
-		}
-		e.encRestore(rs, p, wt, man, mpath) // sempre, mesmo se o agente falhar
-		run.CostUSD += res.CostUSD
+		res, _, err := e.runAgent(ctx, rs, agentRun{
+			prov: prov, proj: p, workDir: wt, phase: provider.PhaseDevelop,
+			model: d.Model, timeout: agentTimeout, readDirs: attDirs, bash: bashAllow,
+			session: analysisSession, inherit: pendingEnc,
+			// Sessão continuada não reenvia regras nem especificação: já estão
+			// no histórico. Sessão nova precisa do contexto completo.
+			prompt:  func(resumado bool) string { pc.Resumed = resumado; return developPrompt(pc, rev.Spec) },
+			encNote: func(n string) { pc.EncodingNote = n },
+		})
+		pendingEnc = "" // consumido por inherit e restaurado pelo runAgent
 		run.SessionID = res.SessionID
 		e.st.UpdateRun(*run)
 		if err != nil {
@@ -567,30 +572,16 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 		d.StatusMessage = fmt.Sprintf("Corrigindo falhas de validação (tentativa %d)", attempt)
 		e.touch(&d, d.StatusMessage)
 		e.save(&d)
-		fman, fpath := e.encPrepare(rs, wt, prov)
-		pc.EncodingNote = encodingNote(fman, fpath != "")
-		fctx, cancel := context.WithTimeout(ctx, agentTimeout)
-		pc.Resumed = run.SessionID != "" // continua a sessão do desenvolvimento
-		res, err := prov.Run(fctx, provider.Request{Phase: provider.PhaseFix, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
-			Prompt: fixPrompt(pc, rev.Spec, output, attempt), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
-			ResumeSession: run.SessionID, EncodingManifest: fpath}, e.agentEmitter(rs))
-		cancel()
-		if err != nil && pc.Resumed && res.SessionID == "" && ctx.Err() == nil {
-			var lim *provider.ErrPlanLimit
-			var pol *provider.ErrPolicy
-			if !errors.As(err, &lim) && !errors.As(err, &pol) {
-				// sessão anterior indisponível: nova sessão com o contexto completo
-				e.log(d, run.ID, domain.LevelWarn, "sessao", "Não foi possível continuar a sessão do desenvolvimento; correção em nova sessão", err.Error())
-				pc.Resumed = false
-				fctx, cancel = context.WithTimeout(ctx, agentTimeout)
-				res, err = prov.Run(fctx, provider.Request{Phase: provider.PhaseFix, WorkDir: wt, SystemPrompt: security.SecurityPreamble,
-					Prompt: fixPrompt(pc, rev.Spec, output, attempt), ExtraReadDirs: attDirs, BashAllow: bashAllow, Model: d.Model,
-					EncodingManifest: fpath}, e.agentEmitter(rs))
-				cancel()
-			}
-		}
-		e.encRestore(rs, p, wt, fman, fpath)
-		run.CostUSD += res.CostUSD
+		res, _, err := e.runAgent(ctx, rs, agentRun{
+			prov: prov, proj: p, workDir: wt, phase: provider.PhaseFix,
+			model: d.Model, timeout: agentTimeout, readDirs: attDirs, bash: bashAllow,
+			session: run.SessionID, // continua a sessão do desenvolvimento
+			prompt: func(resumado bool) string {
+				pc.Resumed = resumado
+				return fixPrompt(pc, rev.Spec, output, attempt)
+			},
+			encNote: func(n string) { pc.EncodingNote = n },
+		})
 		if res.SessionID != "" {
 			run.SessionID = res.SessionID
 		}
@@ -637,6 +628,91 @@ func (e *Engine) process(ctx context.Context, d domain.Demand) {
 	e.setStage(rs, domain.StageReview, domain.StatusAwaitingApproval, "Alterações prontas para inspeção humana")
 	e.log(d, run.ID, domain.LevelAuth, "revisao", "Revisão disponibilizada: inspecione o diff e aprove ou devolva para ajustes",
 		"Branch: "+d.WorkBranch+"\nWorktree: "+wt+"\n\n"+run.DiffStat)
+}
+
+// agentRun descreve uma chamada ao agente dentro de uma execução. Existe para
+// reunir num lugar só tudo que toda chamada precisa fazer e que é fácil
+// esquecer ao acrescentar um caminho novo em process: proteger a codificação
+// dos arquivos antes e desfazê-la depois (inclusive quando o agente falha),
+// aplicar o tempo limite, somar o custo na execução e, quando a sessão anterior
+// não existe mais no provedor, repetir uma vez em sessão nova.
+type agentRun struct {
+	prov     provider.Provider
+	proj     domain.Project
+	workDir  string
+	phase    provider.Phase
+	model    string
+	timeout  time.Duration
+	session  string   // sessão do agente a continuar ("" = sessão nova)
+	bash     []string // prefixos de comando liberados ao agente
+	readDirs []string // pastas extras de leitura (anexos)
+
+	// prompt recebe se a chamada está de fato continuando uma sessão: ao cair
+	// para uma sessão nova, o prompt precisa voltar a carregar o contexto
+	// completo (regras, solicitação, especificação).
+	prompt func(resumado bool) string
+	// encNote, quando informado, recebe o aviso de codificação a incluir no
+	// prompt. É chamado depois da preparação e antes de montar o prompt.
+	encNote func(string)
+	// inherit: manifesto de uma chamada anterior cujos arquivos continuam
+	// convertidos para UTF-8 — a análise entrega os arquivos já convertidos ao
+	// desenvolvimento, que continua a mesma sessão sem reconverter nada.
+	inherit string
+	// keep é avaliado depois da chamada (só faz sentido no modo sob demanda):
+	// se devolver true, os arquivos ficam convertidos e o manifesto volta para
+	// o chamador, que passa a responder pela restauração.
+	keep func(provider.Result, error) bool
+}
+
+// runAgent executa a chamada descrita por a. Devolve o resultado e, quando
+// keep autoriza, o manifesto de codificação que ficou pendente de restauração.
+func (e *Engine) runAgent(ctx context.Context, rs *runState, a agentRun) (res provider.Result, pendente string, err error) {
+	man, path := e.encPrepare(rs, a.workDir, a.prov)
+	if a.inherit != "" && path != "" {
+		man, path = nil, a.inherit // a chamada anterior já converteu estes arquivos
+	}
+	if a.encNote != nil {
+		a.encNote(encodingNote(man, path != ""))
+	}
+	defer func() {
+		if path != "" && a.keep != nil && a.keep(res, err) {
+			pendente = path
+			return
+		}
+		e.encRestore(rs, a.proj, a.workDir, man, path)
+	}()
+
+	req := provider.Request{Phase: a.phase, WorkDir: a.workDir, SystemPrompt: security.SecurityPreamble,
+		ExtraReadDirs: a.readDirs, BashAllow: a.bash, Model: a.model,
+		ResumeSession: a.session, EncodingManifest: path}
+	res, err = e.callAgent(ctx, rs, a, req, a.session != "")
+	if err == nil || a.session == "" || res.SessionID != "" || ctx.Err() != nil {
+		return res, "", err
+	}
+	// Falhou sem sequer abrir uma sessão: a sessão anterior não existe mais no
+	// provedor. Repetir do zero resolve — exceto quando a falha foi de política
+	// de cobrança ou de limite do plano, em que repetir só agrava.
+	var lim *provider.ErrPlanLimit
+	var pol *provider.ErrPolicy
+	if errors.As(err, &lim) || errors.As(err, &pol) {
+		return res, "", err
+	}
+	e.log(*rs.d, rs.run.ID, domain.LevelWarn, "sessao", "Não foi possível continuar a sessão anterior; iniciando uma nova", err.Error())
+	req.ResumeSession = ""
+	res, err = e.callAgent(ctx, rs, a, req, false)
+	return res, "", err
+}
+
+// callAgent monta o prompt, aplica o tempo limite e soma o custo na execução.
+// O custo é somado em TODA tentativa: uma sessão que falhou antes de começar
+// também pode ter consumido tokens.
+func (e *Engine) callAgent(ctx context.Context, rs *runState, a agentRun, req provider.Request, resumado bool) (provider.Result, error) {
+	req.Prompt = a.prompt(resumado)
+	cctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	res, err := a.prov.Run(cctx, req, e.agentEmitter(rs))
+	rs.run.CostUSD += res.CostUSD
+	return res, err
 }
 
 // waitPlanLimit: o limite da assinatura acabou. A demanda volta para a fila na
@@ -794,6 +870,18 @@ func (e *Engine) commitIfConfigured(rs *runState, p domain.Project, repo gitx.Re
 	}
 }
 
+// isDefaultBaseName diz se a branch veio da preferência padrão (main/master,
+// local ou de origin) e não do checkout atual — só muda a mensagem do log.
+func isDefaultBaseName(b string) bool {
+	b = strings.TrimPrefix(b, "origin/")
+	for _, n := range gitx.DefaultBaseNames {
+		if b == n {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Engine) prepareGit(rs *runState, p domain.Project, wt string) error {
 	d := rs.d
 	if err := gitx.Available(); err != nil {
@@ -805,13 +893,17 @@ func (e *Engine) prepareGit(rs *runState, p domain.Project, wt string) error {
 	}
 	e.log(*d, rs.run.ID, domain.LevelInfo, "git", "Repositório validado: "+p.Path, "")
 	if d.BaseBranch == "" {
-		cur, err := main.CurrentBranch()
+		base, err := main.DefaultBase()
 		if err != nil {
 			return err
 		}
-		d.BaseBranch = cur
+		d.BaseBranch = base
 		e.st.UpdateDemandFields(*d)
-		e.log(*d, rs.run.ID, domain.LevelInfo, "git", "Branch base definida pela branch atualmente selecionada: "+cur, "")
+		motivo := "padrão da esteira"
+		if !isDefaultBaseName(base) {
+			motivo = "o repositório não tem main nem master; usando a branch em checkout"
+		}
+		e.log(*d, rs.run.ID, domain.LevelInfo, "git", "Branch base definida automaticamente: "+base+" ("+motivo+")", "")
 	}
 	if !main.RefExists(d.BaseBranch) {
 		return fmt.Errorf("branch base %q não existe no repositório", d.BaseBranch)
@@ -823,7 +915,11 @@ func (e *Engine) prepareGit(rs *runState, p domain.Project, wt string) error {
 		return e.prepareDirect(rs, main, wt)
 	}
 	if d.WorkBranch == "" {
-		name := gitx.SafeBranchName(p.BranchPrefix, d.Ticket, d.Title)
+		if !domain.ValidKind(d.Kind) {
+			// demandas cadastradas antes da convenção de branches
+			return fmt.Errorf("a demanda não tem tipo (%s) definido; edite-a e escolha o tipo antes de executar — ele é o primeiro segmento da branch", strings.Join(domain.Kinds, "/"))
+		}
+		name := gitx.BranchName(d.Kind, d.Ticket)
 		if main.LocalBranchExists(name) {
 			name = fmt.Sprintf("%s-%d", name, d.ID) // nunca reutiliza uma branch que não foi criada por esta demanda
 		}
@@ -1076,7 +1172,12 @@ func (e *Engine) agentEmitter(rs *runState) func(provider.Event) {
 		if ev.Kind == "arquivo_alterado" || ev.Kind == "comando" || ev.Kind == "arquivo_lido" {
 			e.touch(rs.d, ev.Message)
 			rs.d.ElapsedSeconds = rs.baseSecs + int64(time.Since(rs.started).Seconds())
-			e.save(rs.d)
+			// O estado final não se perde: toda saída da etapa passa por
+			// setStage ou block, que gravam sem o intervalo.
+			if time.Since(rs.lastSave) >= activityInterval {
+				rs.lastSave = time.Now()
+				e.save(rs.d)
+			}
 		}
 	}
 }

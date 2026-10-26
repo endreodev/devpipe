@@ -411,7 +411,7 @@ function cardHTML(d, draggable) {
   if (d.status === "executando" || d.status === "na_fila") ops.push(`<button class="btn sm bad" data-act="cancel" data-id="${d.id}">■ ${d.status === "na_fila" ? "Tirar da fila" : "Cancelar"}</button>`);
   if (d.status === "aguardando_aprovacao") ops.push(`<a class="btn sm warn" href="#/demandas/${d.id}">⚑ Revisar</a>`);
   return `<article class="${cls.join(" ")}" style="--sc:${STAGE_COLOR[d.stage]}" data-open="${d.id}" data-id="${d.id}" ${draggable ? 'draggable="true"' : ""}>
-    <div class="top"><span class="tk">${esc(d.ticket)}</span>${badgePrio(d.priority)}<span class="grow"></span>${badgeStatus(d)}</div>
+    <div class="top"><span class="tk">${esc(d.ticket)}</span>${d.kind ? `<span class="badge kind-${esc(d.kind)}">${esc(d.kind)}</span>` : ""}${badgePrio(d.priority)}<span class="grow"></span>${badgeStatus(d)}</div>
     <div class="ttl">${esc(d.title)}</div>
     <div class="meta"><span title="Projeto">⬡ ${esc(d.projectName)}</span><span title="${d.directBranch ? "Direto na branch selecionada" : "Branch"}">⑂ ${esc(d.workBranch || d.baseBranch || "branch atual")}${d.directBranch ? " (direto)" : ""}</span>
       <span title="Tempo de execução">⏱ ${elapsed(d)}</span><span title="Tentativas">↻ ${d.attempts}</span><span title="Provedor">◎ ${esc(d.provider)}</span>${d.currentRevision > 1 ? `<span title="Revisão">rev ${d.currentRevision}</span>` : ""}</div>
@@ -551,9 +551,15 @@ async function demandForm(det) {
     <div class="panel hud">
       <h2>Identificação</h2>
       <div class="grid g2" style="gap:10px">
-        <label class="f"><span>Ticket / chamado <em>*</em></span><input type="text" name="ticket" required value="${esc(d.ticket)}" placeholder="CH-1234"></label>
+        <label class="f"><span>Ticket / chamado <em>*</em></span><input type="text" name="ticket" required value="${esc(d.ticket)}" placeholder="CH101010"></label>
         <label class="f"><span>Prioridade</span><select name="priority">${[1, 2, 3, 4].map((p) => `<option value="${p}" ${d.priority === p ? "selected" : ""}>${PRIO[p]}</option>`).join("")}</select></label>
       </div>
+      <label class="f"><span>Tipo <em>*</em></span>
+        <select name="kind" required ${editing && d.workBranch && d.kind ? "disabled" : ""}>
+          <option value="" ${d.kind ? "" : "selected"} disabled>Selecione o tipo…</option>
+          ${(S.meta?.kinds || []).map((k) => `<option value="${esc(k.id)}" ${d.kind === k.id ? "selected" : ""}>${esc(k.label)}</option>`).join("")}
+        </select>
+        <div class="help" id="kind-help"></div></label>
       <label class="f"><span>Título <em>*</em></span><input type="text" name="title" required value="${esc(d.title)}" placeholder="Ex.: Incluir filtro por período no relatório de vendas"></label>
       <label class="f"><span>Descrição resumida</span><input type="text" name="summary" value="${esc(d.summary)}"></label>
       <label class="f"><span>Requisitos / instruções ${editing && d.stage !== "backlog" ? "(somente leitura — já analisada)" : ""}</span><textarea name="instructions" ${editing && d.stage !== "backlog" ? "readonly" : ""} placeholder="Descreva o que precisa ser feito, regras de negócio, critérios de aceite…">${esc(instr)}</textarea></label>
@@ -630,14 +636,19 @@ async function demandForm(det) {
       }
     } catch (e) { box.innerHTML = `<div class="callout bad">⚠ ${esc(e.message)}</div>`; return; }
     const locked = editing && d.workBranch;
-    const sel = d.baseBranch || "";
+    // Padrão da esteira: main (ver gitx.DefaultBase). A demanda pode trocar.
+    const def = info.defaultBase || "";
+    const sel = d.baseBranch || def;
+    const chips = [...new Set([def, current, ...opts].filter(Boolean))];
     const direct = editing ? !!d.directBranch : (localStorage.getItem("devpipe.directBranch") ?? "1") === "1";
-    box.innerHTML = `<label class="f"><span>Branch base para desenvolver</span>
-      <div class="chips" style="margin-bottom:8px"><span class="chip ${sel === "" ? "on" : ""}" data-branch="">● Atual (${esc(current || "?")})</span>${opts.map((o) => `<span class="chip ${sel === o ? "on" : ""}" data-branch="${esc(o)}">${esc(o)}</span>`).join("")}</div>
-      <select name="baseBranch" ${locked ? "disabled" : ""}><option value="">Branch atualmente selecionada (${esc(current || "?")})</option>${branches.map((b) => `<option value="${esc(b.name)}" ${sel === b.name ? "selected" : ""}>${esc(b.name)}${b.current ? "  (atual)" : ""}${b.remote ? "  [remota]" : ""}</option>`).join("")}</select>
+    box.innerHTML = `<label class="f"><span>Branch base para desenvolver ${def ? `<span class="help" style="display:inline;text-transform:none;letter-spacing:0">— padrão: ${esc(def)}</span>` : ""}</span>
+      <div class="chips" style="margin-bottom:8px">${chips.map((o) => { const bi = branches.find((b) => b.name === o); return `<span class="chip ${sel === o ? "on" : ""}" data-branch="${esc(o)}" title="${bi && bi.behind ? `${bi.behind} commit(s) atrás de ${esc(bi.upstream || "origin")}` : ""}">${esc(o)}${o === def ? " · padrão" : o === current ? " · atual" : ""}${bi && bi.behind ? ` · ↓${bi.behind}` : ""}</span>`; }).join("")}</div>
+      <select name="baseBranch" ${locked ? "disabled" : ""}>${branches.length ? "" : `<option value="">Branch atualmente selecionada (${esc(current || "?")})</option>`}${branches.map((b) => `<option value="${esc(b.name)}" ${sel === b.name ? "selected" : ""}>${esc(b.name)}${b.current ? "  (atual)" : ""}${b.remote ? "  [remota]" : ""}${b.behind ? `  — ${b.behind} commit(s) atrás de ${esc(b.upstream || "origin")}` : ""}</option>`).join("")}</select>
       <div class="help" id="branch-help"></div></label>
       <label class="check"><input type="checkbox" name="directBranch" ${direct ? "checked" : ""} ${locked ? "disabled" : ""}><span>Fazer os ajustes direto nesta branch (não criar branch nova)<br><span class="help">Os commits da demanda são aplicados na própria branch selecionada (somente fast-forward, sem push).</span></span></label>
-      ${info.dirty ? `<div class="callout warn small">⚠ O checkout principal tem ${info.dirty} alteração(ões) não commitada(s). Elas não serão tocadas nem incluídas.</div>` : ""}`;
+      ${info.dirty ? `<div class="callout warn small">⚠ O checkout principal tem ${info.dirty} alteração(ões) não commitada(s). Elas não serão tocadas nem incluídas.</div>` : ""}
+      ${fetchAviso(info)}
+      <div id="stale-box"></div>`;
     const helpBranch = () => {
       const on = form.directBranch?.checked;
       $("#branch-help").textContent = locked
@@ -648,7 +659,26 @@ async function demandForm(det) {
     form.directBranch?.addEventListener("change", () => { localStorage.setItem("devpipe.directBranch", form.directBranch.checked ? "1" : "0"); helpBranch(); });
     helpBranch();
     if (!locked) $$("[data-branch]", box).forEach((c) => c.addEventListener("click", () => { form.baseBranch.value = c.dataset.branch; $$("[data-branch]", box).forEach((x) => x.classList.toggle("on", x === c)); }));
-    form.baseBranch?.addEventListener("change", () => $$("[data-branch]", box).forEach((x) => x.classList.toggle("on", x.dataset.branch === form.baseBranch.value)));
+    const staleAviso = () => {
+      const alvo = $("#stale-box");
+      if (!alvo) return;
+      const b = branches.find((x) => x.name === (form.baseBranch?.value || sel));
+      alvo.innerHTML = b && b.behind
+        ? `<div class="callout warn small">⚠ <b>${esc(b.name)}</b> está <b>${b.behind} commit(s) atrás</b> de ${esc(b.upstream || "origin")}. O DevPipe não faz <span class="mono">git pull</span> no seu checkout (a política proíbe merge automático). Para desenvolver sobre o código atual, escolha <b class="mono">${esc(b.upstream || "origin/" + b.name)}</b> como base, ou atualize a branch você mesmo e selecione o projeto de novo.</div>`
+        : "";
+    };
+    form.baseBranch?.addEventListener("change", () => { $$("[data-branch]", box).forEach((x) => x.classList.toggle("on", x.dataset.branch === form.baseBranch.value)); staleAviso(); });
+    box.addEventListener("click", (e) => { if (e.target.closest("[data-branch]")) staleAviso(); });
+    staleAviso();
+  }
+
+  // resultado da atualização das referências remotas feita ao escolher o projeto
+  function fetchAviso(info) {
+    const f = info.fetch;
+    if (!f) return "";
+    if (f.done) return `<div class="help" style="margin-top:6px">✓ Referências remotas atualizadas (git fetch) ao selecionar o projeto.</div>`;
+    if (f.skipped) return `<div class="help" style="margin-top:6px">Repositório sem remoto configurado — nada a atualizar.</div>`;
+    return `<div class="callout warn small">⚠ Não foi possível atualizar do servidor: ${esc(f.error || "falha no git fetch")}. As branches abaixo podem estar desatualizadas.</div>`;
   }
   form.projectId?.addEventListener("change", () => loadBranches());
   $("#inspect-new")?.addEventListener("click", async () => {
@@ -658,12 +688,26 @@ async function demandForm(det) {
   });
   loadBranches();
 
+  // prévia do nome da branch: o padrão é <TIPO>/<TICKET>_Desenvolvimento
+  const kindHelp = () => {
+    const box = $("#kind-help");
+    if (!box) return;
+    if (form.kind.disabled) { box.textContent = `Bloqueado: a branch ${d.workBranch} já foi criada.`; return; }
+    const k = form.kind.value, t = form.ticket.value.trim();
+    box.innerHTML = k && t
+      ? `Branch de trabalho: <b class="mono">${esc(k)}/${esc(t.replace(/[^A-Za-z0-9._-]+/g, "-"))}${esc(S.meta?.branchSuffix || "_Desenvolvimento")}</b>`
+      : "BUG = erro · FIX = chamado urgente · NR = novo requisito. Define o início do nome da branch.";
+  };
+  form.kind?.addEventListener("change", kindHelp);
+  form.ticket?.addEventListener("input", kindHelp);
+  kindHelp();
+
   let enqueue = "0";
   $$("button[type=submit]", form).forEach((b) => b.addEventListener("click", () => { enqueue = b.dataset.enqueue || "0"; }));
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const data = {
-      ticket: form.ticket.value.trim(), title: form.title.value.trim(), summary: form.summary.value, priority: +form.priority.value,
+      ticket: form.ticket.value.trim(), kind: form.kind.disabled ? d.kind : form.kind.value, title: form.title.value.trim(), summary: form.summary.value, priority: +form.priority.value,
       queueOrder: +form.queueOrder.value || 0, notes: form.notes.value, provider: form.provider.value, model: form.model.value.trim(),
       reviewSpec: form.reviewSpec.checked, baseBranch: form.baseBranch ? form.baseBranch.value : d.baseBranch || "", instructions: form.instructions.value,
       directBranch: form.directBranch ? form.directBranch.checked : !!d.directBranch,
@@ -774,7 +818,7 @@ function runHTML(x, compact) {
   ${x.error ? `<div class="callout bad small" style="margin-top:8px">${esc(x.error)}</div>` : ""}
   ${x.diffStat ? `<pre class="mono small muted" style="white-space:pre-wrap">${esc(x.diffStat)}</pre>` : ""}
   ${x.summary ? (compact ? `<details><summary class="small">Resumo técnico da IA</summary><div class="md small">${md(x.summary)}</div></details>` : `<div class="md small">${md(x.summary)}</div>`) : ""}
-  ${!compact && x.rulesText ? `<details><summary class="small muted">Regras utilizadas nesta execução (auditoria)</summary><div class="md small">${md(x.rulesText)}</div></details>` : ""}</div>`;
+  ${!compact ? `<div class="small muted" style="margin-top:6px" id="rules-${x.id}"><button class="btn sm ghost" data-act="run-rules" data-id="${x.id}">📜 Ver as regras utilizadas nesta execução (auditoria)</button></div>` : ""}</div>`;
 }
 
 function adjustModal(id) {
@@ -822,6 +866,18 @@ document.addEventListener("click", async (e) => {
       toast(`Codificação: ${r.restored} arquivo(s) regravados, ${r.repaired.length} com acentuação recuperada${r.issues.length ? `, ${r.issues.length} problema(s) restantes (veja o log)` : ""}`, r.issues.length ? "err" : "ok");
     }
     if (act === "resume-queue") { await guarded(() => api("POST", "/api/queue/resume"), "Fila retomada"); }
+    if (act === "run-rules") {
+      // carregado sob demanda: o texto composto das regras chega a centenas de KB
+      const box = document.getElementById(`rules-${id}`);
+      if (box) {
+        box.textContent = "Carregando as regras…";
+        try {
+          const r = await api("GET", `/api/runs/${id}/rules`);
+          box.innerHTML = `<div class="small muted">Regras utilizadas (versão <span class="mono">${esc(r.hash)}</span>)</div><div class="md small">${md(r.text)}</div>`;
+        } catch (err) { box.innerHTML = `<div class="callout bad small">${esc(String(err))}</div>`; }
+      }
+      return;
+    }
     if (act === "delete") { if (confirm("Excluir a demanda do cadastro? A branch e a worktree no disco são preservadas.")) { const r = await guarded(() => api("DELETE", `/api/demands/${id}`)); toast(r.message); location.hash = "#/esteira"; await reloadDemands(); } return; }
     await reloadDemands().catch(() => {});
     render(true);
@@ -835,7 +891,7 @@ document.addEventListener("click", async (e) => {
 VIEWS.projetos = async (r) => {
   S.projects = await api("GET", "/api/projects");
   const editing = r.id ? S.projects.find((p) => p.id === +r.id) : null;
-  const p = editing || { autoCommit: true, branchPrefix: "devpipe/", branchOptions: [], standardsFiles: [], agentBashAllow: [] };
+  const p = editing || { autoCommit: true, branchOptions: [], standardsFiles: [], agentBashAllow: [] };
   $("#view").innerHTML = `
   <div class="page-head"><div><h1><small>Cadastros</small>Projetos</h1><div class="sub">Repositórios Git locais que a IA pode modificar. Cada demanda trabalha em uma worktree isolada — o seu checkout nunca é alterado.</div></div></div>
   <div class="grid g2">
@@ -849,7 +905,7 @@ VIEWS.projetos = async (r) => {
         <label class="f"><span>Linguagem predominante</span><input type="text" name="language" value="${esc(p.language)}"></label></div>
       <label class="f"><span>Solução / estrutura principal</span><input type="text" name="mainSolution" value="${esc(p.mainSolution)}" placeholder="Ex.: src/Sistema.sln"></label>
       <label class="f"><span>Atalhos de branch base (separados por vírgula)</span><input type="text" name="branchOptions" value="${esc(p.branchOptions.join(", "))}" placeholder="release, main, main_versao, stage"><div class="help">Aparecem como atalhos no cadastro de demandas. Não são obrigatórios nem universais.</div></label>
-      <div class="grid g2" style="gap:10px"><label class="f"><span>Prefixo das branches de trabalho</span><input type="text" name="branchPrefix" value="${esc(p.branchPrefix)}"></label>
+      <div class="grid g2" style="gap:10px"><label class="f"><span>Branches de trabalho</span><div class="help" style="margin-top:6px">Nomeadas pela convenção da equipe: <b class="mono">BUG|FIX|NR/&lt;ticket&gt;_Desenvolvimento</b>. O tipo vem do cadastro de cada demanda.</div></label>
         <label class="check" style="margin-top:22px"><input type="checkbox" name="autoCommit" ${p.autoCommit ? "checked" : ""}><span>Commit local automático na branch de trabalho<br><span class="help">Nunca faz push nem merge.</span></span></label></div>
       <label class="f"><span>Codificação dos arquivos</span><select name="fileEncoding">
         ${[["auto", "Automática — preserva a de cada arquivo; novos seguem a predominante do repositório"], ["windows-1252", "Windows-1252 (ANSI) para arquivos novos"], ["utf-8", "UTF-8 para arquivos novos"], ["utf-8-bom", "UTF-8 com BOM para arquivos novos"]].map(([v, l]) => `<option value="${v}" ${(p.fileEncoding || "auto") === v ? "selected" : ""}>${l}</option>`).join("")}</select>
@@ -879,7 +935,7 @@ VIEWS.projetos = async (r) => {
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const data = { name: f.name.value, path: f.path.value.trim(), language: f.language.value, mainSolution: f.mainSolution.value,
-      branchOptions: f.branchOptions.value.split(",").map((s) => s.trim()).filter(Boolean), branchPrefix: f.branchPrefix.value, autoCommit: f.autoCommit.checked,
+      branchOptions: f.branchOptions.value.split(",").map((s) => s.trim()).filter(Boolean), autoCommit: f.autoCommit.checked,
       buildCommand: f.buildCommand.value.trim(), testCommand: f.testCommand.value.trim(), agentBashAllow: lines(f.agentBashAllow.value), fileEncoding: f.fileEncoding.value, standardsFiles: lines(f.standardsFiles.value), extraRules: f.extraRules.value };
     const saved = await guarded(() => api(editing ? "PUT" : "POST", editing ? `/api/projects/${p.id}` : "/api/projects", data), "Projeto salvo");
     location.hash = `#/projetos/${saved.id}`; render();
@@ -887,6 +943,8 @@ VIEWS.projetos = async (r) => {
 };
 
 // ------------------------------------------------------------ 6. REGRAS
+// Espelham os limites de internal/rules/folder.go (apenas texto informativo).
+const FOLDER_DEFAULT_GLOB = "*.md; *.markdown; *.txt", FOLDER_MAX_FILES = 60, FOLDER_MAX_KB = 160;
 VIEWS.regras = async (r) => {
   const rules = await api("GET", "/api/rules");
   S.projects = await api("GET", "/api/projects");
@@ -898,7 +956,7 @@ VIEWS.regras = async (r) => {
   <div class="callout info small">Precedência: <b>segurança da aplicação</b> › globais obrigatórias › projeto obrigatórias › projeto › globais recomendadas › instruções da demanda (que nunca podem violar os três primeiros níveis).</div>
   <div class="grid g2">
     <div class="panel"><h2>Regras<span class="count">${rules.length}</span></h2>
-      ${rules.length ? `<table class="list"><tr><th>Regra</th><th>Escopo</th><th>Versão</th><th></th></tr>${rules.map((ru) => `<tr style="${ru.enabled ? "" : "opacity:.5"}"><td><b>${esc(ru.title)}</b>${ru.mandatory ? ' <span class="badge prio-1">obrigatória</span>' : ""}<div class="small dim">${esc(ru.category)}${ru.pathGlob ? " · " + esc(ru.pathGlob) : ""}${ru.language ? " · " + esc(ru.language) : ""}</div></td><td class="small">${ru.scope === "global" ? "Global" : "Projeto: " + esc(pname(ru.projectId))}<div class="dim">prioridade ${ru.priority}</div></td><td class="mono small">v${ru.version}</td><td><a class="btn sm" href="#/regras/${ru.id}">Editar</a></td></tr>`).join("")}</table>` : emptyState("Nenhuma regra", " Cadastre convenções, arquitetura, padrões de banco, testes…")}
+      ${rules.length ? `<table class="list"><tr><th>Regra</th><th>Escopo</th><th>Versão</th><th></th></tr>${rules.map((ru) => `<tr style="${ru.enabled ? "" : "opacity:.5"}"><td><b>${esc(ru.title)}</b>${ru.mandatory ? ' <span class="badge prio-1">obrigatória</span>' : ""}<div class="small dim">${esc(ru.category)}${ru.pathGlob ? " · " + esc(ru.pathGlob) : ""}${ru.language ? " · " + esc(ru.language) : ""}</div>${ru.sourceDir ? `<div class="small mono dim" title="Pasta de padrões lida a cada execução">📁 ${esc(ru.sourceDir)}${ru.sourceGlob ? " · " + esc(ru.sourceGlob) : ""}</div>` : ""}</td><td class="small">${ru.scope === "global" ? "Global" : "Projeto: " + esc(pname(ru.projectId))}<div class="dim">prioridade ${ru.priority}</div></td><td class="mono small">v${ru.version}</td><td><a class="btn sm" href="#/regras/${ru.id}">Editar</a></td></tr>`).join("")}</table>` : emptyState("Nenhuma regra", " Cadastre convenções, arquitetura, padrões de banco, testes…")}
       <h3 style="margin-top:18px">Importar arquivo de padrões</h3>
       <form id="rimport" class="row"><input type="file" name="file" accept=".md,.txt,.markdown,.docx,.pdf" class="grow"><select name="scope" style="width:auto"><option value="global">Global</option>${S.projects.map((p) => `<option value="p${p.id}">Projeto: ${esc(p.name)}</option>`).join("")}</select><button class="btn" type="submit">Importar</button></form>
       <h3 style="margin-top:18px">Pré-visualizar o que a IA recebe</h3>
@@ -913,7 +971,14 @@ VIEWS.regras = async (r) => {
         <label class="f"><span>Prioridade (menor = mais forte)</span><input type="number" name="priority" value="${x.priority}"></label></div>
       <div class="grid g2" style="gap:10px"><label class="f"><span>Aplicar a diretórios/arquivos</span><input type="text" name="pathGlob" class="mono" value="${esc(x.pathGlob)}" placeholder="src/Dados/**"></label>
         <label class="f"><span>Aplicar à linguagem</span><input type="text" name="language" value="${esc(x.language)}" placeholder="C#"></label></div>
-      <label class="f"><span>Conteúdo (texto ou Markdown) <em>*</em></span><textarea name="content" class="code" required>${esc(x.content)}</textarea></label>
+      <fieldset class="fieldbox">
+        <legend>Pasta de padrões (opcional)</legend>
+        <div class="small muted" style="margin-bottom:8px">Aponte uma pasta do computador com os padrões que você já mantém para outras ferramentas. Ela é lida <b>somente para leitura</b> a cada execução — editou os arquivos, a próxima demanda já usa a versão nova, sem recadastrar nada.</div>
+        <label class="f"><span>Caminho da pasta</span><input type="text" name="sourceDir" class="mono" value="${esc(x.sourceDir)}" placeholder="C:\\padroes\\desenvolvimento"></label>
+        <label class="f"><span>Arquivos considerados (separe por ";")</span><input type="text" name="sourceGlob" class="mono" value="${esc(x.sourceGlob)}" placeholder="*.md; *.txt; backend/**"></label>
+        <div class="row"><button type="button" class="btn sm" id="rfolder">Conferir arquivos da pasta</button><span class="small dim">Vazio = ${esc(FOLDER_DEFAULT_GLOB)} · limites: ${FOLDER_MAX_FILES} arquivos / ${FOLDER_MAX_KB} KB</span></div>
+      </fieldset>
+      <label class="f"><span>Conteúdo (texto ou Markdown)${x.sourceDir ? "" : " <em>*</em>"}</span><textarea name="content" class="code" placeholder="Obrigatório quando nenhuma pasta de padrões é informada.">${esc(x.content)}</textarea></label>
       <label class="check"><input type="checkbox" name="mandatory" ${x.mandatory ? "checked" : ""}><span>Obrigatória (não pode ser contrariada por instruções da demanda)</span></label>
       <label class="check"><input type="checkbox" name="enabled" ${x.enabled ? "checked" : ""}><span>Ativa</span></label>
       <div class="row"><button class="btn primary" type="submit">Salvar ${editing ? "nova versão" : "regra"}</button>${editing ? `<a class="btn ghost" href="#/regras">Nova</a><button type="button" class="btn bad" id="rdel">Excluir</button>` : ""}</div>
@@ -921,9 +986,20 @@ VIEWS.regras = async (r) => {
   const f = $("#rform");
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const data = { scope: f.scope.value, projectId: +f.projectId.value || 0, title: f.title.value, category: f.category.value, priority: +f.priority.value || 100, pathGlob: f.pathGlob.value, language: f.language.value, content: f.content.value, mandatory: f.mandatory.checked, enabled: f.enabled.checked };
+    const data = { scope: f.scope.value, projectId: +f.projectId.value || 0, title: f.title.value, category: f.category.value, priority: +f.priority.value || 100, pathGlob: f.pathGlob.value, language: f.language.value, sourceDir: f.sourceDir.value.trim(), sourceGlob: f.sourceGlob.value.trim(), content: f.content.value, mandatory: f.mandatory.checked, enabled: f.enabled.checked };
     const s = await guarded(() => api(editing ? "PUT" : "POST", editing ? `/api/rules/${x.id}` : "/api/rules", data), "Regra salva");
     location.hash = `#/regras/${s.id}`; render();
+  });
+  $("#rfolder").addEventListener("click", async () => {
+    const dir = f.sourceDir.value.trim();
+    if (!dir) { toast("Informe o caminho da pasta de padrões", "err"); return; }
+    const q = new URLSearchParams({ dir, glob: f.sourceGlob.value.trim() });
+    const r = await guarded(() => api("GET", `/api/rules/folder?${q}`));
+    const rows = r.files.map((it) => `<tr><td class="mono small">${esc(it.rel)}</td><td class="small">${it.bytes ? fileSize(it.bytes) : "—"}</td><td class="small dim">${esc(it.note)}</td></tr>`).join("");
+    openModal(`<h2>Pasta de padrões</h2><div class="small muted mono">${esc(r.dir)}</div>
+      <div class="small" style="margin:8px 0">Filtro <code>${esc(r.glob)}</code> · ${r.files.length} arquivo(s) · ${fileSize(r.bytes)} enviados à IA${r.skipped ? ` · <b>${r.skipped} fora pelo limite</b>` : ""}</div>
+      ${r.files.length ? `<table class="list" style="max-height:50vh;overflow:auto;display:block"><tr><th>Arquivo</th><th>Tamanho</th><th>Observação</th></tr>${rows}</table>` : `<div class="callout warn small">Nenhum arquivo casou com o filtro.</div>`}
+      <div class="row" style="margin-top:12px"><button class="btn" data-close>Fechar</button></div>`);
   });
   $("#rdel")?.addEventListener("click", async () => { if (confirm("Excluir esta regra?")) { await guarded(() => api("DELETE", `/api/rules/${x.id}`), "Regra excluída"); location.hash = "#/regras"; } });
   $("#rimport").addEventListener("submit", async (e) => {
@@ -1034,6 +1110,9 @@ VIEWS.config = async () => {
       <label class="f"><span>Nome</span><input type="text" name="cName" value="${esc(s.commitAuthorName || "")}" placeholder="vazio = user.name do Git do repositório"></label>
       <label class="f"><span>E-mail</span><input type="text" name="cEmail" value="${esc(s.commitAuthorEmail || "")}" placeholder="vazio = user.email do Git do repositório"><div class="help">Use o mesmo usuário do Azure DevOps para que os commits apareçam com seu avatar e contem nos relatórios. Gravado somente nesta máquina (não vai para o código nem para o Git).</div></label>
     </div>
+      <h3 style="margin-top:16px">Áreas de trabalho das demandas</h3>
+      <label class="f"><span>Pasta onde as branches das demandas são criadas</span><input type="text" name="wtRoot" class="mono" value="${esc(s.worktreeRoot || "")}" placeholder="D:\\repos\\devpipe_demandas"><div class="help">Cada demanda ganha uma worktree Git própria em <span class="mono">&lt;pasta&gt;\\p&lt;projeto&gt;\\&lt;demanda&gt;-&lt;ticket&gt;</span> — é uma cópia do repositório, então use um disco de trabalho e não o perfil do usuário. Vale para demandas <b>novas</b>: as que já começaram continuam onde estão. Vazio = subpasta da pasta de dados.</div></label>
+    </div>
     <div class="panel hud"><h2>Segurança</h2>
       <label class="f"><span>Diretórios autorizados (um por linha)</span><textarea name="roots" class="mono" placeholder="C:\\repos">${esc((s.authorizedRoots || []).join("\n"))}</textarea><div class="help">Projetos fora destes diretórios são recusados. Vazio = qualquer repositório cadastrado (não recomendado).</div></label>
       <div class="callout info small"><div><b>Políticas fixas (não configuráveis):</b><ul style="margin:6px 0 0;padding-left:18px">
@@ -1051,7 +1130,8 @@ VIEWS.config = async () => {
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const st = { ...S.settings, maxParallel: +f.maxParallel.value || 1, maxFixAttempts: +f.maxFix.value, agentTimeoutMin: +f.agentTO.value || 45, commandTimeoutMin: +f.cmdTO.value || 15,
-      authorizedRoots: f.roots.value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean), commitAuthorName: f.cName.value.trim(), commitAuthorEmail: f.cEmail.value.trim() };
+      authorizedRoots: f.roots.value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean), commitAuthorName: f.cName.value.trim(), commitAuthorEmail: f.cEmail.value.trim(),
+      worktreeRoot: f.wtRoot.value.trim() };
     S.settings = await guarded(() => api("PUT", "/api/settings", st), "Configurações salvas");
   });
 };

@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -35,7 +34,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.2.8"
+const Version = "0.3.1"
 
 type Server struct {
 	st      *store.Store
@@ -43,7 +42,6 @@ type Server struct {
 	reg     *provider.Registry
 	dataDir string
 	port    int
-	mu      sync.Mutex
 }
 
 func New(st *store.Store, eng *pipeline.Engine, reg *provider.Registry, dataDir string, port int) *Server {
@@ -125,6 +123,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		return map[string]any{"restored": len(rep.Restored), "repaired": rep.Repaired, "issues": issues}, nil
 	})
+	h("GET /api/runs/{id}/rules", s.runRules)
 	h("POST /api/queue/reorder", s.reorder)
 	mux.HandleFunc("GET /api/attachments/{id}", s.downloadAttachment)
 
@@ -137,6 +136,7 @@ func (s *Server) Handler() http.Handler {
 	h("DELETE /api/rules/{id}", func(w http.ResponseWriter, r *http.Request) (any, error) { return nil, s.st.DeleteRule(pid(r)) })
 	h("POST /api/rules/import", s.importRuleFile)
 	h("GET /api/rules/preview", s.previewRules)
+	h("GET /api/rules/folder", s.checkRuleFolder)
 
 	h("GET /api/settings", func(w http.ResponseWriter, r *http.Request) (any, error) { return s.st.GetSettings() })
 	h("PUT /api/settings", s.saveSettings)
@@ -221,29 +221,47 @@ func (s *Server) meta(w http.ResponseWriter, r *http.Request) (any, error) {
 	for _, x := range domain.AllStages {
 		stages = append(stages, st{x, domain.StageLabels[x]})
 	}
-	return map[string]any{"version": Version, "stages": stages, "dataDir": s.dataDir}, nil
+	type kd struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+	}
+	var kinds []kd
+	for _, k := range domain.Kinds {
+		kinds = append(kinds, kd{k, domain.KindLabels[k]})
+	}
+	return map[string]any{"version": Version, "stages": stages, "kinds": kinds, "branchSuffix": gitx.DevSuffix, "dataDir": s.dataDir}, nil
 }
 
 // ------------------------------------------------------------------ projetos
 
 type inspectResult struct {
-	Valid      bool              `json:"valid"`
-	Message    string            `json:"message"`
-	Path       string            `json:"path"`
-	Current    string            `json:"current"`
-	Branches   []gitx.BranchInfo `json:"branches"`
-	Language   string            `json:"language"`
-	Solution   string            `json:"solution"`
-	Suggested  []string          `json:"suggestedOptions"`
-	Dirty      int               `json:"dirty"`
-	Authorized bool              `json:"authorized"`
-	Standards  []string          `json:"standardsFound"`
+	Valid     bool              `json:"valid"`
+	Message   string            `json:"message"`
+	Path      string            `json:"path"`
+	Current   string            `json:"current"`
+	Branches  []gitx.BranchInfo `json:"branches"`
+	Language  string            `json:"language"`
+	Solution  string            `json:"solution"`
+	Suggested []string          `json:"suggestedOptions"`
+	// DefaultBase: branch base sugerida quando a demanda não escolhe nenhuma
+	// (main por padrão — ver gitx.DefaultBase).
+	DefaultBase string   `json:"defaultBase"`
+	Dirty       int      `json:"dirty"`
+	Authorized  bool     `json:"authorized"`
+	Standards   []string `json:"standardsFound"`
 	// NeedsInit: a pasta não existe ou ainda não é um repositório Git. O
 	// projeto pode ser salvo mesmo assim: o DevPipe cria um repositório local.
 	NeedsInit bool `json:"needsInit"`
+	// Fetch: resultado da atualização das referências remotas, quando pedida.
+	Fetch *gitx.FetchResult `json:"fetch,omitempty"`
 }
 
-func (s *Server) inspect(path string) inspectResult {
+func (s *Server) inspect(path string) inspectResult { return s.inspectFetching(path, false) }
+
+// inspectFetching examina o repositório do projeto. Com fetch=true atualiza
+// antes as referências remotas, para que a lista de branches e a contagem de
+// "commits atrás" reflitam o servidor — sem tocar em nenhuma branch local.
+func (s *Server) inspectFetching(path string, fetch bool) inspectResult {
 	res := inspectResult{Path: path}
 	settings, _ := s.st.GetSettings()
 	res.Authorized = security.IsPathAuthorized(path, settings.AuthorizedRoots)
@@ -274,8 +292,23 @@ func (s *Server) inspect(path string) inspectResult {
 		return res
 	}
 	res.Valid, res.Path = true, top
+	if fetch {
+		f := (gitx.Repo{Dir: top}).Fetch()
+		res.Fetch = &f
+	}
 	res.Current, _ = repo.CurrentBranch()
 	res.Branches, _ = repo.Branches()
+	res.DefaultBase, _ = repo.DefaultBase()
+	// Se a branch padrão local ficou para trás do servidor, sugerir a própria
+	// ref remota: a worktree nasce do código atual sem que nada do checkout do
+	// usuário precise ser alterado. Continua sendo só sugestão — a tela mostra
+	// o atraso e a escolha é dele.
+	for _, b := range res.Branches {
+		if !b.Remote && b.Name == res.DefaultBase && b.Behind > 0 && b.Upstream != "" {
+			res.DefaultBase = b.Upstream
+			break
+		}
+	}
 	if d, err := repo.StatusPorcelain(); err == nil {
 		res.Dirty = len(d)
 	}
@@ -386,12 +419,15 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) (any, error
 	return p, nil
 }
 
+// projectBranches é chamado quando o usuário escolhe o projeto no cadastro da
+// demanda: atualiza as referências remotas antes de listar as branches, para
+// ninguém escolher uma base desatualizada. Passe ?fetch=0 para só ler.
 func (s *Server) projectBranches(w http.ResponseWriter, r *http.Request) (any, error) {
 	p, err := s.st.GetProject(pid(r))
 	if err != nil {
 		return nil, err
 	}
-	return s.inspect(p.Path), nil
+	return s.inspectFetching(p.Path, r.URL.Query().Get("fetch") != "0"), nil
 }
 
 // ------------------------------------------------------------------ demandas
@@ -430,8 +466,12 @@ func (s *Server) createDemand(w http.ResponseWriter, r *http.Request) (any, erro
 	}
 	d := in.Demand
 	d.Ticket, d.Title = strings.TrimSpace(d.Ticket), strings.TrimSpace(d.Title)
+	d.Kind = strings.ToUpper(strings.TrimSpace(d.Kind))
 	if d.Ticket == "" || d.Title == "" {
 		return nil, errors.New("ticket e título são obrigatórios")
+	}
+	if !domain.ValidKind(d.Kind) {
+		return nil, fmt.Errorf("informe o tipo da demanda (%s) — ele define a branch de trabalho", strings.Join(domain.Kinds, ", "))
 	}
 	if in.NewProject != nil && in.NewProject.Path != "" {
 		name := in.NewProject.Name
@@ -582,9 +622,18 @@ func (s *Server) getDemand(w http.ResponseWriter, r *http.Request) (any, error) 
 	if err != nil {
 		return nil, err
 	}
-	revs, _ := s.st.ListRevisions(id)
-	atts, _ := s.st.ListAttachments(id)
-	runs, _ := s.st.ListRuns(id)
+	revs, err := s.st.ListRevisions(id)
+	if err != nil {
+		return nil, fmt.Errorf("revisões da demanda: %w", err)
+	}
+	atts, err := s.st.ListAttachments(id)
+	if err != nil {
+		return nil, fmt.Errorf("anexos da demanda: %w", err)
+	}
+	runs, err := s.st.ListRuns(id)
+	if err != nil {
+		return nil, fmt.Errorf("execuções da demanda: %w", err)
+	}
 	return map[string]any{"demand": d, "revisions": revs, "attachments": atts, "runs": runs, "running": s.eng.IsRunning(id)}, nil
 }
 
@@ -603,8 +652,17 @@ func (s *Server) updateDemand(w http.ResponseWriter, r *http.Request) (any, erro
 	}
 	d := in.Demand
 	d.ID = id
+	d.Kind = strings.ToUpper(strings.TrimSpace(d.Kind))
 	if strings.TrimSpace(d.Ticket) == "" || strings.TrimSpace(d.Title) == "" {
 		return nil, errors.New("ticket e título são obrigatórios")
+	}
+	if !domain.ValidKind(d.Kind) {
+		return nil, fmt.Errorf("informe o tipo da demanda (%s) — ele define a branch de trabalho", strings.Join(domain.Kinds, ", "))
+	}
+	// O tipo é o primeiro segmento da branch: depois que ela existe, trocar o
+	// tipo aqui só criaria divergência entre o cadastro e o repositório.
+	if cur.WorkBranch != "" && cur.Kind != "" && d.Kind != cur.Kind {
+		return nil, fmt.Errorf("o tipo não pode ser alterado depois que a branch %s foi criada", cur.WorkBranch)
 	}
 	if cur.WorkBranch != "" && d.BaseBranch != cur.BaseBranch {
 		return nil, errors.New("a branch base não pode ser alterada após a criação da branch de trabalho")
@@ -618,7 +676,9 @@ func (s *Server) updateDemand(w http.ResponseWriter, r *http.Request) (any, erro
 	// instruções da revisão original podem ser editadas enquanto não analisadas
 	if cur.Stage == domain.StageBacklog && cur.CurrentRevision == 1 {
 		if rev, err := s.st.GetRevision(id, 1); err == nil && rev.Spec == "" && in.Instructions != rev.Instructions {
-			s.st.DB().Exec(`UPDATE revisions SET instructions=? WHERE id=?`, in.Instructions, rev.ID)
+			if err := s.st.UpdateRevisionInstructions(rev.ID, in.Instructions); err != nil {
+				return nil, err
+			}
 		}
 	}
 	full, _ := s.st.GetDemand(id)
@@ -821,6 +881,17 @@ func (s *Server) diffFile(w http.ResponseWriter, r *http.Request) (any, error) {
 	return map[string]any{"file": fc, "diff": security.Redact(displayText(string(raw))), "truncated": trunc}, nil
 }
 
+// runRules entrega a trilha de auditoria de uma execução sob demanda: o texto
+// composto das regras não vem na listagem de execuções porque é grande demais
+// para ser carregado em lote (ver store.runCols).
+func (s *Server) runRules(w http.ResponseWriter, r *http.Request) (any, error) {
+	hash, text, err := s.st.RunRules(pid(r))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"hash": hash, "text": text}, nil
+}
+
 func (s *Server) reorder(w http.ResponseWriter, r *http.Request) (any, error) {
 	var in struct{ IDs []int64 }
 	if err := decode(r, &in); err != nil {
@@ -887,8 +958,17 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) (any, error) {
 		return nil, err
 	}
 	ru.ID = pid(r)
-	if strings.TrimSpace(ru.Title) == "" || strings.TrimSpace(ru.Content) == "" {
-		return nil, errors.New("título e conteúdo são obrigatórios")
+	ru.SourceDir, ru.SourceGlob = strings.TrimSpace(ru.SourceDir), strings.TrimSpace(ru.SourceGlob)
+	if strings.TrimSpace(ru.Title) == "" {
+		return nil, errors.New("o título é obrigatório")
+	}
+	if strings.TrimSpace(ru.Content) == "" && ru.SourceDir == "" {
+		return nil, errors.New("informe o conteúdo da regra ou uma pasta de padrões")
+	}
+	if ru.SourceDir != "" {
+		if err := checkStandardsDir(ru.SourceDir); err != nil {
+			return nil, err
+		}
 	}
 	if ru.Scope == "projeto" {
 		if _, err := s.st.GetProject(ru.ProjectID); err != nil {
@@ -936,6 +1016,36 @@ func (s *Server) importRuleFile(w http.ResponseWriter, r *http.Request) (any, er
 	return ru, nil
 }
 
+// checkStandardsDir valida a pasta de padrões informada numa regra. A pasta é
+// lida somente para leitura, a cada execução — nada dentro dela é alterado.
+func checkStandardsDir(dir string) error {
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("a pasta de padrões deve ser um caminho absoluto: %s", dir)
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("pasta de padrões não encontrada: %s", dir)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("o caminho informado não é uma pasta: %s", dir)
+	}
+	return nil
+}
+
+// checkRuleFolder lista o que a esteira leria da pasta de padrões, para o
+// usuário conferir filtro e tamanho antes de salvar a regra.
+func (s *Server) checkRuleFolder(w http.ResponseWriter, r *http.Request) (any, error) {
+	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
+	if err := checkStandardsDir(dir); err != nil {
+		return nil, err
+	}
+	res := rules.ReadFolder(dir, r.URL.Query().Get("glob"))
+	if res.Error != "" {
+		return nil, errors.New(res.Error)
+	}
+	return res, nil
+}
+
 func (s *Server) previewRules(w http.ResponseWriter, r *http.Request) (any, error) {
 	id, _ := strconv.ParseInt(r.URL.Query().Get("project"), 10, 64)
 	p, err := s.st.GetProject(id)
@@ -964,6 +1074,17 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) (any, erro
 	}
 	if st.Claude.PermissionMode == "bypassPermissions" {
 		return nil, errors.New("o modo bypassPermissions não é permitido na esteira")
+	}
+	st.WorktreeRoot = strings.TrimSpace(st.WorktreeRoot)
+	if st.WorktreeRoot != "" {
+		if !filepath.IsAbs(st.WorktreeRoot) {
+			return nil, fmt.Errorf("a pasta das áreas de trabalho deve ser um caminho absoluto: %s", st.WorktreeRoot)
+		}
+		// Criada agora para a falha aparecer aqui, e não no meio de uma
+		// demanda (disco inexistente, sem permissão).
+		if err := os.MkdirAll(st.WorktreeRoot, 0o755); err != nil {
+			return nil, fmt.Errorf("não foi possível usar a pasta das áreas de trabalho %s: %w", st.WorktreeRoot, err)
+		}
 	}
 	st.CommitAuthorName, st.CommitAuthorEmail = strings.TrimSpace(st.CommitAuthorName), strings.TrimSpace(st.CommitAuthorEmail)
 	if strings.ContainsAny(st.CommitAuthorName+st.CommitAuthorEmail, "<>\n\r") || (st.CommitAuthorEmail != "" && !strings.Contains(st.CommitAuthorEmail, "@")) {

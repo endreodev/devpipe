@@ -13,13 +13,16 @@ import (
 
 // ---------- Projetos ----------
 
-const projectCols = `id,name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,branch_prefix,auto_commit,file_encoding,created_at,updated_at`
+// projectCols nao inclui branch_prefix: o nome da branch passou a seguir a
+// convencao <TIPO>/<TICKET>_Desenvolvimento (ver gitx.BranchName). A coluna
+// continua no banco com os valores antigos, apenas sem uso.
+const projectCols = `id,name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,auto_commit,file_encoding,created_at,updated_at`
 
 func scanProject(r interface{ Scan(...any) error }) (domain.Project, error) {
 	var p domain.Project
 	var bo, sf, ab string
 	var ac int
-	err := r.Scan(&p.ID, &p.Name, &p.Path, &p.Language, &p.MainSolution, &bo, &sf, &p.ExtraRules, &p.BuildCommand, &p.TestCommand, &ab, &p.BranchPrefix, &ac, &p.FileEncoding, &p.CreatedAt, &p.UpdatedAt)
+	err := r.Scan(&p.ID, &p.Name, &p.Path, &p.Language, &p.MainSolution, &bo, &sf, &p.ExtraRules, &p.BuildCommand, &p.TestCommand, &ab, &ac, &p.FileEncoding, &p.CreatedAt, &p.UpdatedAt)
 	p.BranchOptions, p.StandardsFiles, p.AgentBashAllow = fromJSONList(bo), fromJSONList(sf), fromJSONList(ab)
 	p.AutoCommit = ac == 1
 	return p, err
@@ -52,17 +55,14 @@ func (s *Store) GetProject(id int64) (domain.Project, error) {
 
 func (s *Store) SaveProject(p *domain.Project) error {
 	t := now()
-	if p.BranchPrefix == "" {
-		p.BranchPrefix = "devpipe/"
-	}
 	if p.FileEncoding == "" {
 		p.FileEncoding = "auto"
 	}
 	if p.ID == 0 {
 		p.CreatedAt = t
 		p.UpdatedAt = t
-		res, err := s.db.Exec(`INSERT INTO projects(name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,branch_prefix,auto_commit,file_encoding,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.BranchPrefix, b2i(p.AutoCommit), p.FileEncoding, t, t)
+		res, err := s.db.Exec(`INSERT INTO projects(name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,auto_commit,file_encoding,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), b2i(p.AutoCommit), p.FileEncoding, t, t)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return fmt.Errorf("já existe um projeto cadastrado com este caminho")
@@ -73,8 +73,8 @@ func (s *Store) SaveProject(p *domain.Project) error {
 		return nil
 	}
 	p.UpdatedAt = t
-	_, err := s.db.Exec(`UPDATE projects SET name=?,path=?,language=?,main_solution=?,branch_options=?,standards_files=?,extra_rules=?,build_command=?,test_command=?,agent_bash_allow=?,branch_prefix=?,auto_commit=?,file_encoding=?,updated_at=? WHERE id=?`,
-		p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.BranchPrefix, b2i(p.AutoCommit), p.FileEncoding, t, p.ID)
+	_, err := s.db.Exec(`UPDATE projects SET name=?,path=?,language=?,main_solution=?,branch_options=?,standards_files=?,extra_rules=?,build_command=?,test_command=?,agent_bash_allow=?,auto_commit=?,file_encoding=?,updated_at=? WHERE id=?`,
+		p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), b2i(p.AutoCommit), p.FileEncoding, t, p.ID)
 	return err
 }
 
@@ -97,13 +97,13 @@ func nz(v []string) []string {
 
 // ---------- Demandas ----------
 
-const demandCols = `d.id,d.ticket,d.title,d.summary,d.project_id,COALESCE(p.name,''),d.priority,d.queue_order,d.notes,d.base_branch,d.work_branch,d.worktree_path,d.provider,d.model,d.review_spec,d.stage,d.blocked_from,d.status,d.status_message,d.progress,d.attempts,d.validation_state,d.current_revision,d.last_activity,d.last_activity_at,d.elapsed_seconds,d.started_at,d.created_at,d.updated_at,COALESCE(d.direct_branch,0),COALESCE(d.base_commit,'')`
+const demandCols = `d.id,d.ticket,COALESCE(d.kind,''),d.title,d.summary,d.project_id,COALESCE(p.name,''),d.priority,d.queue_order,d.notes,d.base_branch,d.work_branch,d.worktree_path,d.provider,d.model,d.review_spec,d.stage,d.blocked_from,d.status,d.status_message,d.progress,d.attempts,d.validation_state,d.current_revision,d.last_activity,d.last_activity_at,d.elapsed_seconds,d.started_at,d.created_at,d.updated_at,COALESCE(d.direct_branch,0),COALESCE(d.base_commit,'')`
 
 func scanDemand(r interface{ Scan(...any) error }) (domain.Demand, error) {
 	var d domain.Demand
 	var rs, direta int
 	var la, st sql.NullTime
-	err := r.Scan(&d.ID, &d.Ticket, &d.Title, &d.Summary, &d.ProjectID, &d.ProjectName, &d.Priority, &d.QueueOrder, &d.Notes, &d.BaseBranch, &d.WorkBranch, &d.WorktreePath, &d.Provider, &d.Model, &rs, &d.Stage, &d.BlockedFrom, &d.Status, &d.StatusMessage, &d.Progress, &d.Attempts, &d.ValidationState, &d.CurrentRevision, &d.LastActivity, &la, &d.ElapsedSeconds, &st, &d.CreatedAt, &d.UpdatedAt, &direta, &d.BaseCommit)
+	err := r.Scan(&d.ID, &d.Ticket, &d.Kind, &d.Title, &d.Summary, &d.ProjectID, &d.ProjectName, &d.Priority, &d.QueueOrder, &d.Notes, &d.BaseBranch, &d.WorkBranch, &d.WorktreePath, &d.Provider, &d.Model, &rs, &d.Stage, &d.BlockedFrom, &d.Status, &d.StatusMessage, &d.Progress, &d.Attempts, &d.ValidationState, &d.CurrentRevision, &d.LastActivity, &la, &d.ElapsedSeconds, &st, &d.CreatedAt, &d.UpdatedAt, &direta, &d.BaseCommit)
 	d.ReviewSpec = rs == 1
 	d.DirectBranch = direta == 1
 	if la.Valid {
@@ -120,9 +120,13 @@ func scanDemand(r interface{ Scan(...any) error }) (domain.Demand, error) {
 type DemandFilter struct {
 	ProjectID int64
 	Stage     string
-	Query     string
-	Branch    string
-	From, To  *time.Time
+	// Status filtra por status de execução (domain.StatusQueued etc.). O
+	// agendador usa este filtro a cada ciclo: sem ele, a fila carregaria todas
+	// as demandas do banco três vezes por minuto só para descartar quase todas.
+	Status   string
+	Query    string
+	Branch   string
+	From, To *time.Time
 }
 
 func (s *Store) ListDemands(f DemandFilter) ([]domain.Demand, error) {
@@ -135,6 +139,10 @@ func (s *Store) ListDemands(f DemandFilter) ([]domain.Demand, error) {
 	if f.Stage != "" {
 		q += ` AND d.stage=?`
 		args = append(args, f.Stage)
+	}
+	if f.Status != "" {
+		q += ` AND d.status=?`
+		args = append(args, f.Status)
 	}
 	if f.Branch != "" {
 		q += ` AND (d.base_branch=? OR d.work_branch=?)`
@@ -194,8 +202,8 @@ func (s *Store) CreateDemand(d *domain.Demand, instructions string) (domain.Revi
 	}
 	d.Stage, d.Status, d.CurrentRevision = domain.StageBacklog, domain.StatusIdle, 1
 	d.CreatedAt, d.UpdatedAt = t, t
-	res, err := tx.Exec(`INSERT INTO demands(ticket,title,summary,project_id,priority,queue_order,notes,base_branch,provider,model,review_spec,stage,status,current_revision,created_at,updated_at,direct_branch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		d.Ticket, d.Title, d.Summary, d.ProjectID, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), d.Stage, d.Status, 1, t, t, b2i(d.DirectBranch))
+	res, err := tx.Exec(`INSERT INTO demands(ticket,kind,title,summary,project_id,priority,queue_order,notes,base_branch,provider,model,review_spec,stage,status,current_revision,created_at,updated_at,direct_branch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		d.Ticket, d.Kind, d.Title, d.Summary, d.ProjectID, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), d.Stage, d.Status, 1, t, t, b2i(d.DirectBranch))
 	if err != nil {
 		return domain.Revision{}, err
 	}
@@ -211,8 +219,8 @@ func (s *Store) CreateDemand(d *domain.Demand, instructions string) (domain.Revi
 
 // UpdateDemandFields atualiza campos editáveis pelo usuário.
 func (s *Store) UpdateDemandFields(d domain.Demand) error {
-	_, err := s.db.Exec(`UPDATE demands SET ticket=?,title=?,summary=?,priority=?,queue_order=?,notes=?,base_branch=?,provider=?,model=?,review_spec=?,direct_branch=?,updated_at=? WHERE id=?`,
-		d.Ticket, d.Title, d.Summary, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), b2i(d.DirectBranch), now(), d.ID)
+	_, err := s.db.Exec(`UPDATE demands SET ticket=?,kind=?,title=?,summary=?,priority=?,queue_order=?,notes=?,base_branch=?,provider=?,model=?,review_spec=?,direct_branch=?,updated_at=? WHERE id=?`,
+		d.Ticket, d.Kind, d.Title, d.Summary, d.Priority, d.QueueOrder, d.Notes, d.BaseBranch, d.Provider, d.Model, b2i(d.ReviewSpec), b2i(d.DirectBranch), now(), d.ID)
 	return err
 }
 
@@ -284,6 +292,21 @@ func (s *Store) SetRevisionSpec(revID int64, spec string, approved bool) error {
 	return err
 }
 
+// UpdateRevisionInstructions corrige as instruções de uma revisão que ainda não
+// foi analisada. A condição `spec=”` faz parte do UPDATE de propósito: depois
+// que a IA gera a especificação, as instruções são a entrada auditável daquilo
+// que ela recebeu e não podem mais ser reescritas.
+func (s *Store) UpdateRevisionInstructions(revID int64, instructions string) error {
+	res, err := s.db.Exec(`UPDATE revisions SET instructions=? WHERE id=? AND spec=''`, instructions, revID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("a revisão já tem especificação gerada; as instruções não podem mais ser alteradas")
+	}
+	return nil
+}
+
 // ---------- Anexos ----------
 
 func (s *Store) AddAttachment(a *domain.Attachment) error {
@@ -331,12 +354,19 @@ func (s *Store) GetAttachment(id int64) (domain.Attachment, error) {
 
 // ---------- Execuções ----------
 
-const runCols = `id,demand_id,revision_num,provider,status,stage,rules_hash,rules_text,session_id,summary,error,cost_usd,diff_stat,commit_sha,started_at,finished_at`
+// runCols NÃO inclui rules_text de propósito. O texto composto das regras
+// passa de 180 KB em projetos que apontam uma pasta de padrões, e ele é
+// gravado uma vez por execução: listar as execuções de uma demanda com a
+// coluna junto significava arrastar mais de 1 MB em páginas de overflow do
+// SQLite a cada abertura da tela da demanda e a cada consulta interna do
+// agendador (lastSummary, hasDevRun). Para auditar uma execução específica use
+// RunRules.
+const runCols = `id,demand_id,revision_num,provider,status,stage,rules_hash,session_id,summary,error,cost_usd,diff_stat,commit_sha,started_at,finished_at`
 
 func scanRun(r interface{ Scan(...any) error }) (domain.Run, error) {
 	var x domain.Run
 	var fin sql.NullTime
-	err := r.Scan(&x.ID, &x.DemandID, &x.RevisionNum, &x.Provider, &x.Status, &x.Stage, &x.RulesHash, &x.RulesText, &x.SessionID, &x.Summary, &x.Error, &x.CostUSD, &x.DiffStat, &x.CommitSHA, &x.StartedAt, &fin)
+	err := r.Scan(&x.ID, &x.DemandID, &x.RevisionNum, &x.Provider, &x.Status, &x.Stage, &x.RulesHash, &x.SessionID, &x.Summary, &x.Error, &x.CostUSD, &x.DiffStat, &x.CommitSHA, &x.StartedAt, &fin)
 	if fin.Valid {
 		t := fin.Time
 		x.FinishedAt = &t
@@ -359,6 +389,17 @@ func (s *Store) UpdateRun(r domain.Run) error {
 	_, err := s.db.Exec(`UPDATE runs SET status=?,stage=?,session_id=?,summary=?,error=?,cost_usd=?,diff_stat=?,commit_sha=?,finished_at=? WHERE id=?`,
 		r.Status, r.Stage, r.SessionID, r.Summary, r.Error, r.CostUSD, r.DiffStat, r.CommitSHA, r.FinishedAt, r.ID)
 	return err
+}
+
+// RunRules devolve o texto integral das regras usadas numa execução, junto com
+// o hash gravado. É a trilha de auditoria: carregada sob demanda, nunca em
+// lote (ver runCols).
+func (s *Store) RunRules(runID int64) (hash, text string, err error) {
+	err = s.db.QueryRow(`SELECT rules_hash,rules_text FROM runs WHERE id=?`, runID).Scan(&hash, &text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	return hash, text, err
 }
 
 func (s *Store) ListRuns(demandID int64) ([]domain.Run, error) {
@@ -459,7 +500,7 @@ func (s *Store) ListEvents(f EventFilter) ([]domain.Event, error) {
 
 // ---------- Regras ----------
 
-const ruleCols = `id,scope,project_id,title,category,content,path_glob,language,mandatory,priority,enabled,version,updated_at`
+const ruleCols = `id,scope,project_id,title,category,content,source_dir,source_glob,path_glob,language,mandatory,priority,enabled,version,updated_at`
 
 func (s *Store) ListRules(projectID int64, onlyEnabled bool) ([]domain.Rule, error) {
 	q := `SELECT ` + ruleCols + ` FROM rules WHERE 1=1`
@@ -481,7 +522,7 @@ func (s *Store) ListRules(projectID int64, onlyEnabled bool) ([]domain.Rule, err
 	for rows.Next() {
 		var r domain.Rule
 		var m, e int
-		if err := rows.Scan(&r.ID, &r.Scope, &r.ProjectID, &r.Title, &r.Category, &r.Content, &r.PathGlob, &r.Language, &m, &r.Priority, &e, &r.Version, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Scope, &r.ProjectID, &r.Title, &r.Category, &r.Content, &r.SourceDir, &r.SourceGlob, &r.PathGlob, &r.Language, &m, &r.Priority, &e, &r.Version, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Mandatory, r.Enabled = m == 1, e == 1
@@ -498,8 +539,8 @@ func (s *Store) SaveRule(r *domain.Rule) error {
 	}
 	if r.ID == 0 {
 		r.Version = 1
-		res, err := s.db.Exec(`INSERT INTO rules(scope,project_id,title,category,content,path_glob,language,mandatory,priority,enabled,version,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-			r.Scope, r.ProjectID, r.Title, r.Category, r.Content, r.PathGlob, r.Language, b2i(r.Mandatory), r.Priority, b2i(r.Enabled), 1, t)
+		res, err := s.db.Exec(`INSERT INTO rules(scope,project_id,title,category,content,source_dir,source_glob,path_glob,language,mandatory,priority,enabled,version,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			r.Scope, r.ProjectID, r.Title, r.Category, r.Content, r.SourceDir, r.SourceGlob, r.PathGlob, r.Language, b2i(r.Mandatory), r.Priority, b2i(r.Enabled), 1, t)
 		if err != nil {
 			return err
 		}
@@ -511,8 +552,8 @@ func (s *Store) SaveRule(r *domain.Rule) error {
 			return ErrNotFound
 		}
 		r.Version = cur + 1
-		_, err := s.db.Exec(`UPDATE rules SET scope=?,project_id=?,title=?,category=?,content=?,path_glob=?,language=?,mandatory=?,priority=?,enabled=?,version=?,updated_at=? WHERE id=?`,
-			r.Scope, r.ProjectID, r.Title, r.Category, r.Content, r.PathGlob, r.Language, b2i(r.Mandatory), r.Priority, b2i(r.Enabled), r.Version, t, r.ID)
+		_, err := s.db.Exec(`UPDATE rules SET scope=?,project_id=?,title=?,category=?,content=?,source_dir=?,source_glob=?,path_glob=?,language=?,mandatory=?,priority=?,enabled=?,version=?,updated_at=? WHERE id=?`,
+			r.Scope, r.ProjectID, r.Title, r.Category, r.Content, r.SourceDir, r.SourceGlob, r.PathGlob, r.Language, b2i(r.Mandatory), r.Priority, b2i(r.Enabled), r.Version, t, r.ID)
 		if err != nil {
 			return err
 		}

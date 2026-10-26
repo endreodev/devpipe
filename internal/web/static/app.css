@@ -81,6 +81,8 @@ textarea{min-height:110px;resize:vertical;font-family:var(--sans)}
 textarea.code{font-family:var(--mono);font-size:12.5px;min-height:260px}
 input:focus,select:focus,textarea:focus{border-color:var(--cyan2);outline:none;box-shadow:0 0 0 3px rgba(34,211,238,.12)}
 .help{font-size:12px;color:var(--dim);margin-top:4px}
+.fieldbox{border:1px solid var(--line);border-radius:7px;padding:10px 12px 2px;margin:0 0 12px}
+.fieldbox>legend{padding:0 6px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
 .check{display:flex;gap:8px;align-items:flex-start;margin-bottom:10px;cursor:pointer}
 .check input{margin-top:3px;accent-color:var(--cyan)}
 .drop{border:1px dashed var(--line2);border-radius:8px;padding:18px;text-align:center;color:var(--muted);cursor:pointer;transition:border-color .15s,background .15s}
@@ -103,6 +105,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--cyan2);outline:none;b
 .prio-3{color:var(--blue);border-color:#60a5fa66}
 .prio-4{color:var(--muted)}
 .v-ok{color:var(--green);border-color:#34d39966} .v-falhou{color:var(--red);border-color:#f8717166} .v-nao_executada{color:var(--amber);border-color:#fbbf2466}
+/* tipo da demanda: primeiro segmento da branch (BUG/FIX/NR) */
+.kind-BUG{color:var(--red);border-color:#f8717166;background:rgba(248,113,113,.10)}
+.kind-FIX{color:var(--orange);border-color:#fb923c77;background:rgba(251,146,60,.10)}
+.kind-NR{color:var(--cyan);border-color:#22d3ee55;background:rgba(34,211,238,.10)}
 .st-executando{color:var(--violet);border-color:#c084fc66} .st-na_fila{color:var(--cyan);border-color:#22d3ee55}
 .st-aguardando_aprovacao{color:var(--amber);border-color:#fbbf2466} .st-falhou{color:var(--red);border-color:#f8717166} .st-cancelado{color:var(--orange);border-color:#fb923c66} .st-concluido{color:var(--green);border-color:#34d39966}
 

@@ -8,7 +8,11 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"devpipe/internal/gittest"
 )
+
+func init() { gittest.SemAutoCRLF() }
 
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()

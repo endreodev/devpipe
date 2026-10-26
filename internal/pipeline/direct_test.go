@@ -36,7 +36,7 @@ func TestDirectBranchCheckedOut(t *testing.T) {
 	// alteração local do usuário em outro arquivo: deve ser preservada
 	os.WriteFile(filepath.Join(p.Path, "README.md"), []byte("demo\nminha alteração\n"), 0o644)
 
-	d := domain.Demand{Ticket: "CH-7", Title: "Direto", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
+	d := domain.Demand{Ticket: "CH-7", Kind: domain.KindNR, Title: "Direto", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
 	st.CreateDemand(&d, "Criar feature.txt contendo ok")
 	e.Enqueue(d.ID)
 	got := waitFor(t, st, d.ID, emRevisao(e, 1))
@@ -84,7 +84,7 @@ func TestDirectBranchCheckedOut(t *testing.T) {
 func TestDirectBranchConflict(t *testing.T) {
 	e, st, p := setup(t, fakeAgent)
 	headAntes := gitOut(t, p.Path, "rev-parse", "HEAD")
-	d := domain.Demand{Ticket: "CH-9", Title: "Conflito", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
+	d := domain.Demand{Ticket: "CH-9", Kind: domain.KindBug, Title: "Conflito", ProjectID: p.ID, Provider: "generico", DirectBranch: true}
 	st.CreateDemand(&d, "Criar feature.txt contendo ok")
 	e.Enqueue(d.ID)
 	waitFor(t, st, d.ID, emRevisao(e, 1))
@@ -109,7 +109,7 @@ func TestDirectBranchConflict(t *testing.T) {
 func TestDirectBranchNotCheckedOut(t *testing.T) {
 	e, st, p := setup(t, fakeAgent)
 	gitOut(t, p.Path, "branch", "release")
-	d := domain.Demand{Ticket: "CH-8", Title: "Release", ProjectID: p.ID, Provider: "generico", DirectBranch: true, BaseBranch: "release"}
+	d := domain.Demand{Ticket: "CH-8", Kind: domain.KindFix, Title: "Release", ProjectID: p.ID, Provider: "generico", DirectBranch: true, BaseBranch: "release"}
 	st.CreateDemand(&d, "Criar feature.txt contendo ok")
 	e.Enqueue(d.ID)
 	got := waitFor(t, st, d.ID, emRevisao(e, 1))

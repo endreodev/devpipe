@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"devpipe/internal/domain"
 )
 
 // Projeto sem repositório Git: a pasta (existente ou não) é aceita e o DevPipe
@@ -61,7 +63,7 @@ func TestNewProjectDemandWorksDirectOnFolder(t *testing.T) {
 	criar := func(path string) map[string]any {
 		var buf bytes.Buffer
 		mw := multipart.NewWriter(&buf)
-		data, _ := json.Marshal(map[string]any{"ticket": "N-1", "title": "Novo", "instructions": "criar",
+		data, _ := json.Marshal(map[string]any{"ticket": "N-1", "kind": domain.KindNR, "title": "Novo", "instructions": "criar",
 			"newProject": map[string]string{"path": path}})
 		mw.WriteField("data", string(data))
 		mw.Close()

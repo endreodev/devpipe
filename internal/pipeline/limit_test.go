@@ -27,7 +27,7 @@ func TestPlanLimitPausesQueueAndRequeues(t *testing.T) {
 	e, st, p := setup(t, "true")
 	lp := &limitProvider{}
 	e.reg.Register(lp)
-	d := domain.Demand{Ticket: "L-1", Title: "limite", ProjectID: p.ID, Provider: "limite"}
+	d := domain.Demand{Ticket: "L-1", Kind: domain.KindBug, Title: "limite", ProjectID: p.ID, Provider: "limite"}
 	st.CreateDemand(&d, "x")
 	e.Enqueue(d.ID)
 	got := waitFor(t, st, d.ID, func(x domain.Demand) bool {

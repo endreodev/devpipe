@@ -6,7 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"devpipe/internal/gittest"
 )
+
+func init() { gittest.SemAutoCRLF() }
 
 func TestMergeWorkingTreeFrom(t *testing.T) {
 	tmp := t.TempDir()

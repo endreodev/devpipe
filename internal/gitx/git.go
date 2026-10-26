@@ -28,7 +28,11 @@ type Logger func(cmd string, out string, err error)
 var Log Logger = func(string, string, error) {}
 
 func (r Repo) git(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	return r.gitTimeout(2*time.Minute, args...)
+}
+
+func (r Repo) gitTimeout(d time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = r.Dir
@@ -131,6 +135,64 @@ type BranchInfo struct {
 	Name    string `json:"name"`
 	Remote  bool   `json:"remote"`
 	Current bool   `json:"current"`
+	// Upstream, Behind e Ahead comparam a branch local com o que o último
+	// fetch trouxe do remoto. Behind > 0 significa que desenvolver a partir
+	// dela começaria com código desatualizado.
+	Upstream string `json:"upstream,omitempty"`
+	Behind   int    `json:"behind,omitempty"`
+	Ahead    int    `json:"ahead,omitempty"`
+}
+
+// FetchResult resume a atualização das referências remotas.
+type FetchResult struct {
+	Done    bool   `json:"done"`    // o fetch rodou com sucesso
+	Skipped bool   `json:"skipped"` // repositório sem remoto configurado
+	Error   string `json:"error,omitempty"`
+}
+
+// Fetch atualiza as referências remotas (refs/remotes/*) e remove as que não
+// existem mais no servidor.
+//
+// É a forma SEGURA de "atualizar os códigos": não altera nenhuma branch local,
+// não mexe na árvore de trabalho e não pode gerar conflito — ao contrário de
+// `git pull`, que faz merge no checkout do usuário e é proibido pela política
+// da esteira. Com o fetch em dia, Branches() consegue dizer quantos commits
+// cada branch local está atrás do remoto, e uma demanda pode usar a própria
+// ref remota (ex.: origin/main) como base.
+//
+// Nunca pede credencial (GIT_TERMINAL_PROMPT=0) e tem tempo limite curto: a
+// tela do cadastro espera por ele.
+func (r Repo) Fetch() FetchResult {
+	remotes, err := r.git("remote")
+	if err != nil {
+		return FetchResult{Error: err.Error()}
+	}
+	if strings.TrimSpace(remotes) == "" {
+		return FetchResult{Skipped: true} // repositório local, sem servidor
+	}
+	if _, err := r.gitTimeout(45*time.Second, "fetch", "--all", "--prune", "--no-tags", "--quiet"); err != nil {
+		return FetchResult{Error: err.Error()}
+	}
+	return FetchResult{Done: true}
+}
+
+// aheadBehind conta os commits que separam a branch local do seu upstream.
+func (r Repo) aheadBehind(branch string) (upstream string, ahead, behind int) {
+	upstream, err := r.git("rev-parse", "--abbrev-ref", "--symbolic-full-name", branch+"@{upstream}")
+	if err != nil || upstream == "" {
+		return "", 0, 0
+	}
+	out, err := r.git("rev-list", "--left-right", "--count", branch+"..."+upstream)
+	if err != nil {
+		return upstream, 0, 0
+	}
+	f := strings.Fields(out)
+	if len(f) != 2 {
+		return upstream, 0, 0
+	}
+	ahead, _ = strconv.Atoi(f[0])
+	behind, _ = strconv.Atoi(f[1])
+	return upstream, ahead, behind
 }
 
 func (r Repo) Branches() ([]BranchInfo, error) {
@@ -140,6 +202,7 @@ func (r Repo) Branches() ([]BranchInfo, error) {
 		return nil, err
 	}
 	seen := map[string]bool{}
+	atrasada := map[string]bool{} // local que ficou para trás do seu upstream
 	var list []BranchInfo
 	for _, l := range strings.Split(out, "\n") {
 		l = strings.TrimSpace(l)
@@ -147,7 +210,11 @@ func (r Repo) Branches() ([]BranchInfo, error) {
 		case strings.HasPrefix(l, "refs/heads/"):
 			n := strings.TrimPrefix(l, "refs/heads/")
 			seen[n] = true
-			list = append(list, BranchInfo{Name: n, Current: n == cur})
+			up, ahead, behind := r.aheadBehind(n)
+			if behind > 0 {
+				atrasada[n] = true
+			}
+			list = append(list, BranchInfo{Name: n, Current: n == cur, Upstream: up, Ahead: ahead, Behind: behind})
 		case strings.HasPrefix(l, "refs/remotes/"):
 			n := strings.TrimPrefix(l, "refs/remotes/")
 			if strings.HasSuffix(n, "/HEAD") {
@@ -156,11 +223,15 @@ func (r Repo) Branches() ([]BranchInfo, error) {
 			list = append(list, BranchInfo{Name: n, Remote: true})
 		}
 	}
-	// remove remotas que já existem localmente com o mesmo nome curto
+	// Remove as remotas redundantes: quando já existe uma local de mesmo nome
+	// curto E ela está em dia, as duas apontam para o mesmo commit e listar as
+	// duas só confunde. Se a local está ATRASADA, a remota permanece na lista —
+	// é ela que permite começar a demanda a partir do código atual do servidor
+	// sem alterar nada no checkout do usuário.
 	filtered := list[:0]
 	for _, b := range list {
 		if b.Remote {
-			if i := strings.Index(b.Name, "/"); i > 0 && seen[b.Name[i+1:]] {
+			if i := strings.Index(b.Name, "/"); i > 0 && seen[b.Name[i+1:]] && !atrasada[b.Name[i+1:]] {
 				continue
 			}
 		}
@@ -187,6 +258,27 @@ func (r Repo) StatusPorcelain() ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
+// DefaultBaseNames é a ordem de preferência da branch base quando a demanda
+// não escolhe nenhuma: main sempre primeiro.
+var DefaultBaseNames = []string{"main", "master"}
+
+// DefaultBase devolve a branch base padrão do repositório: "main" quando
+// existe (local ou em origin), depois "master" e, só então, a branch que
+// estiver em checkout. Nunca altera o checkout do usuário.
+func (r Repo) DefaultBase() (string, error) {
+	for _, n := range DefaultBaseNames {
+		if r.LocalBranchExists(n) {
+			return n, nil
+		}
+	}
+	for _, n := range DefaultBaseNames {
+		if r.RefExists("refs/remotes/origin/" + n) {
+			return "origin/" + n, nil
+		}
+	}
+	return r.CurrentBranch()
+}
+
 func (r Repo) RefExists(ref string) bool {
 	_, err := r.git("rev-parse", "--verify", "--quiet", ref+"^{commit}")
 	return err == nil
@@ -200,24 +292,45 @@ func (r Repo) LocalBranchExists(name string) bool {
 var invalidBranchChars = regexp.MustCompile(`[^A-Za-z0-9._/\-]+`)
 
 // SafeBranchName gera um nome de branch válido e previsível.
-func SafeBranchName(prefix, ticket, title string) string {
-	base := strings.ToLower(ticket)
-	if t := strings.ToLower(title); t != "" {
-		t = stripAccents(t)
-		words := strings.Fields(invalidBranchChars.ReplaceAllString(t, " "))
-		if len(words) > 5 {
-			words = words[:5]
-		}
-		if len(words) > 0 {
-			base += "-" + strings.Join(words, "-")
-		}
+// DevSuffix identifica a branch em que a esteira desenvolve, conforme a
+// convenção da equipe.
+const DevSuffix = "_Desenvolvimento"
+
+// BranchName monta o nome da branch de trabalho no padrão da equipe:
+//
+//	<TIPO>/<TICKET>_Desenvolvimento   ex.: BUG/CH101010_Desenvolvimento
+//
+// O tipo (BUG, FIX, NR) vem do cadastro da demanda. O ticket é usado como foi
+// digitado — só os caracteres que o Git não aceita em um nome de referência
+// são trocados por "-", para que o nome continue reconhecível no Azure DevOps.
+func BranchName(kind, ticket string) string {
+	t := sanitizeRefPart(ticket)
+	if t == "" {
+		t = "demanda"
 	}
-	base = invalidBranchChars.ReplaceAllString(base, "-")
-	base = strings.Trim(regexp.MustCompile(`-+`).ReplaceAllString(base, "-"), "-./")
-	if base == "" {
-		base = "demanda"
+	k := sanitizeRefPart(kind)
+	if k == "" {
+		return t + DevSuffix
 	}
-	return prefix + base
+	return k + "/" + t + DevSuffix
+}
+
+var repeatedDashes = regexp.MustCompile(`-+`)
+
+// invalidRefPart: o que não pode aparecer DENTRO de um segmento. Ao contrário
+// de invalidBranchChars, a barra também é trocada — a convenção tem exatamente
+// uma, entre o tipo e o ticket.
+var invalidRefPart = regexp.MustCompile(`[^A-Za-z0-9._\-]+`)
+
+// sanitizeRefPart deixa um segmento válido para git check-ref-format,
+// preservando maiúsculas, minúsculas e os separadores que o Git aceita.
+func sanitizeRefPart(s string) string {
+	s = stripAccents(strings.TrimSpace(s))
+	s = invalidRefPart.ReplaceAllString(s, "-")
+	s = repeatedDashes.ReplaceAllString(s, "-")
+	s = strings.ReplaceAll(s, "..", "-") // ".." é proibido em nome de referência
+	s = strings.Trim(s, "-./")
+	return strings.TrimSuffix(s, ".lock") // sufixo reservado pelo Git
 }
 
 func stripAccents(s string) string {

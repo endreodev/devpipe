@@ -2,7 +2,9 @@
 // Estratégia de isolamento: cada demanda recebe uma "git worktree" própria,
 // em um diretório separado, numa branch de trabalho criada a partir da branch
 // base. O checkout do usuário (e suas alterações não commitadas) nunca é tocado.
-// Nenhuma operação de merge, push, reset ou descarte é executada.
+// Nenhuma operação de merge, reset, rebase ou descarte é executada. A única
+// escrita fora da máquina é Push, que publica a branch da demanda por avanço
+// (fast-forward), nunca com --force, e só é chamada após aprovação humana.
 package gitx
 
 import (
@@ -31,7 +33,24 @@ func (r Repo) git(args ...string) (string, error) {
 	return r.gitTimeout(2*time.Minute, args...)
 }
 
+// gitQuiet roda um comando cuja falha é esperada e não interessa à auditoria
+// (consultas em que "não existe" é uma resposta válida). Sucesso continua
+// sendo registrado; só o erro é omitido do log.
+func (r Repo) gitQuiet(args ...string) (string, error) {
+	out, err := r.run(2*time.Minute, args...)
+	if err == nil {
+		Log("git "+strings.Join(args, " "), out, nil)
+	}
+	return out, err
+}
+
 func (r Repo) gitTimeout(d time.Duration, args ...string) (string, error) {
+	out, err := r.run(d, args...)
+	Log("git "+strings.Join(args, " "), out, err)
+	return out, err
+}
+
+func (r Repo) run(d time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -49,8 +68,7 @@ func (r Repo) gitTimeout(d time.Duration, args ...string) (string, error) {
 		}
 		err = fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
-	Log("git "+strings.Join(args, " "), s, err)
-	return s, err
+	return s, err // quem registra na auditoria é gitTimeout/gitQuiet
 }
 
 // Available informa se o executável git existe.
@@ -109,10 +127,19 @@ func (r Repo) Init() (string, error) {
 	if _, err := r.git("add", "-A"); err != nil {
 		return "", err
 	}
-	args := []string{"commit", "--allow-empty", "-q", "-m", "Commit inicial (repositório criado pelo DevPipe)"}
+	args := []string{"commit", "--allow-empty", "-q", "-m", "Commit inicial"}
 	if email, _ := r.git("config", "user.email"); strings.TrimSpace(email) == "" {
-		// sem identidade Git configurada na máquina: usa uma identidade local só para este commit
-		args = append([]string{"-c", "user.name=DevPipe", "-c", "user.email=devpipe@localhost"}, args...)
+		// Sem identidade Git na máquina: usa uma só para este commit. O nome
+		// fica gravado no histórico do repositório, então não pode identificar
+		// a ferramenta — se o autor foi configurado, é ele que vale.
+		nome, email := strings.TrimSpace(CommitAuthorName), strings.TrimSpace(CommitAuthorEmail)
+		if nome == "" {
+			nome = "Desenvolvimento"
+		}
+		if email == "" {
+			email = "desenvolvimento@localhost"
+		}
+		args = append([]string{"-c", "user.name=" + nome, "-c", "user.email=" + email}, args...)
 	}
 	if _, err := r.git(args...); err != nil {
 		return "", err
@@ -150,6 +177,16 @@ type FetchResult struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// PushResult resume a publicação da branch de trabalho no servidor.
+type PushResult struct {
+	Done    bool   `json:"done"`              // o push rodou com sucesso
+	Skipped bool   `json:"skipped"`           // repositório sem remoto configurado
+	Already bool   `json:"already,omitempty"` // o servidor já estava neste commit
+	Remote  string `json:"remote,omitempty"`  // remoto usado (origin, quando existe)
+	Branch  string `json:"branch,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 // Fetch atualiza as referências remotas (refs/remotes/*) e remove as que não
 // existem mais no servidor.
 //
@@ -177,8 +214,13 @@ func (r Repo) Fetch() FetchResult {
 }
 
 // aheadBehind conta os commits que separam a branch local do seu upstream.
+//
+// Branch sem upstream é o caso NORMAL (toda branch local criada aqui começa
+// assim), não um erro: a consulta usa gitQuiet para não encher o devpipe.log
+// com um "fatal: no upstream configured" por branch a cada vez que a tela de
+// cadastro lista as branches.
 func (r Repo) aheadBehind(branch string) (upstream string, ahead, behind int) {
-	upstream, err := r.git("rev-parse", "--abbrev-ref", "--symbolic-full-name", branch+"@{upstream}")
+	upstream, err := r.gitQuiet("rev-parse", "--abbrev-ref", "--symbolic-full-name", branch+"@{upstream}")
 	if err != nil || upstream == "" {
 		return "", 0, 0
 	}
@@ -304,15 +346,57 @@ const DevSuffix = "_Desenvolvimento"
 // digitado — só os caracteres que o Git não aceita em um nome de referência
 // são trocados por "-", para que o nome continue reconhecível no Azure DevOps.
 func BranchName(kind, ticket string) string {
+	return branchWithSuffix(kind, ticket, DevSuffix)
+}
+
+// TargetBranchName monta o nome da branch de teste, que segue a mesma convenção
+// trocando o sufixo pelo alvo escolhido:
+//
+//	<TIPO>/<TICKET>_<alvo>   ex.: BUG/CH101010_stage, BUG/CH101010_release
+//
+// O alvo é o nome da branch de origem (sem o remoto: origin/release -> release).
+func TargetBranchName(kind, ticket, alvo string) string {
+	a := sanitizeRefPart(TargetName(alvo))
+	if a == "" {
+		a = "teste"
+	}
+	return branchWithSuffix(kind, ticket, "_"+a)
+}
+
+// TargetName reduz a branch de origem escolhida ao nome usado no sufixo:
+// "origin/release" -> "release".
+func TargetName(alvo string) string {
+	alvo = strings.TrimSpace(alvo)
+	if i := strings.LastIndex(alvo, "/"); i >= 0 {
+		alvo = alvo[i+1:]
+	}
+	return alvo
+}
+
+// NormalizeBranchName limpa um nome de branch digitado na tela, preservando a
+// convenção <TIPO>/<TICKET>_<sufixo>: cada segmento passa pelas mesmas regras
+// de BranchName (acento removido, caractere recusado pelo Git vira "-") e as
+// barras separadoras são mantidas. Devolve "" quando não sobra nada válido.
+func NormalizeBranchName(s string) string {
+	var partes []string
+	for _, p := range strings.Split(strings.TrimSpace(s), "/") {
+		if p = sanitizeRefPart(p); p != "" {
+			partes = append(partes, p)
+		}
+	}
+	return strings.Join(partes, "/")
+}
+
+func branchWithSuffix(kind, ticket, sufixo string) string {
 	t := sanitizeRefPart(ticket)
 	if t == "" {
 		t = "demanda"
 	}
 	k := sanitizeRefPart(kind)
 	if k == "" {
-		return t + DevSuffix
+		return t + sufixo
 	}
-	return k + "/" + t + DevSuffix
+	return k + "/" + t + sufixo
 }
 
 var repeatedDashes = regexp.MustCompile(`-+`)
@@ -422,6 +506,18 @@ func (r Repo) CommitAll(msg string) (string, error) {
 	if _, err := r.git("add", "-A"); err != nil {
 		return "", err
 	}
+	args := r.identityArgs()
+	args = append(args, "commit", "--no-verify", "-m", msg)
+	if _, err := r.git(args...); err != nil {
+		return "", err
+	}
+	return r.HeadSHA(), nil
+}
+
+// identityArgs devolve o prefixo "-c user.name=... -c user.email=..." do
+// commit. Vazio quando o Git da máquina já tem identidade e nenhum autor foi
+// configurado na aplicação.
+func (r Repo) identityArgs() []string {
 	name, email := strings.TrimSpace(CommitAuthorName), strings.TrimSpace(CommitAuthorEmail)
 	if email == "" {
 		email, _ = r.git("config", "user.email")
@@ -429,18 +525,64 @@ func (r Repo) CommitAll(msg string) (string, error) {
 	if name == "" {
 		name, _ = r.git("config", "user.name")
 	}
-	args := []string{}
+	var args []string
 	if name != "" {
 		args = append(args, "-c", "user.name="+name)
 	}
 	if email != "" {
 		args = append(args, "-c", "user.email="+email)
 	}
-	args = append(args, "commit", "--no-verify", "-m", msg)
-	if _, err := r.git(args...); err != nil {
+	return args
+}
+
+// CommitPaths commita SOMENTE os caminhos indicados.
+//
+// Usado quando a branch da demanda está aberta no checkout do usuário: o que
+// ele tiver alterado em OUTROS arquivos continua pendente, exatamente como
+// estava — "git commit --only" não encosta no resto do índice. Devolve ""
+// quando não há nada a commitar nesses caminhos.
+func (r Repo) CommitPaths(paths []string, msg string) (string, error) {
+	if len(paths) == 0 {
+		return "", nil
+	}
+	if _, err := r.git(append([]string{"add", "--"}, paths...)...); err != nil {
+		return "", err
+	}
+	out, err := r.git(append([]string{"diff", "--cached", "--name-only", "--"}, paths...)...)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", nil
+	}
+	args := append(r.identityArgs(), "commit", "--no-verify", "--only", "-m", msg, "--")
+	if _, err := r.git(append(args, paths...)...); err != nil {
 		return "", err
 	}
 	return r.HeadSHA(), nil
+}
+
+// FilesSince lista os arquivos que a demanda tocou desde base: os dos commits
+// da área de trabalho e os que ainda estiverem pendentes nela.
+func (r Repo) FilesSince(base string) []string {
+	vistos := map[string]bool{}
+	var out []string
+	add := func(fs []string) {
+		for _, f := range fs {
+			if f = strings.TrimSpace(f); f != "" && !vistos[f] {
+				vistos[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	if raw, err := r.gitRaw("-c", "core.quotepath=false", "diff", "--name-only", "-z", base, "HEAD"); err == nil {
+		add(splitZ(raw))
+	}
+	if pend, err := r.ChangedPaths(); err == nil {
+		add(pend)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // DetectStack identifica linguagem e solução principal por heurística simples.
@@ -688,10 +830,70 @@ func (r Repo) PublishToBranch(branch, newSHA string) (onde string, err error) {
 		}
 		return "checkout " + dir + " atualizado (fast-forward)", nil
 	}
-	if _, err := r.git("update-ref", "-m", "DevPipe: fast-forward", "refs/heads/"+branch, newSHA, tip); err != nil {
+	if _, err := r.git("update-ref", "-m", "fast-forward", "refs/heads/"+branch, newSHA, tip); err != nil {
 		return "", err
 	}
 	return "branch atualizada (fast-forward)", nil
+}
+
+// Push publica a branch de trabalho no servidor.
+//
+// É a ÚNICA operação da aplicação que escreve fora da máquina do usuário e
+// por isso nunca é automática: só roda depois da aprovação humana da revisão
+// e apenas se o projeto tiver a opção habilitada. As restrições são fixas:
+//
+//   - refspec explícita refs/heads/<branch>:refs/heads/<branch> — publica só
+//     a branch da demanda, nunca outra ref, nunca tags, nunca "--all";
+//   - sem --force, --force-with-lease ou qualquer variante: se o servidor
+//     recusar por não ser avanço (fast-forward), o push falha e o histórico
+//     remoto fica exatamente como estava — nada é reescrito nem descartado;
+//   - GIT_TERMINAL_PROMPT=0 (herdado de run): sem credencial configurada o
+//     comando falha em vez de travar esperando digitação.
+//
+// Sem remoto configurado não é erro: não há onde publicar (Skipped).
+func (r Repo) Push(branch string) PushResult {
+	res := PushResult{Branch: branch}
+	remotes, err := r.git("remote")
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	res.Remote = pickRemote(remotes)
+	if res.Remote == "" {
+		res.Skipped = true // repositório local, sem servidor
+		return res
+	}
+	tip, err := r.BranchTip(branch)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	if rtip, err := r.gitQuiet("rev-parse", "--verify", "refs/remotes/"+res.Remote+"/"+branch+"^{commit}"); err == nil && rtip == tip {
+		res.Done, res.Already = true, true
+		return res
+	}
+	ref := "refs/heads/" + branch
+	if _, err := r.gitTimeout(3*time.Minute, "push", "--set-upstream", res.Remote, ref+":"+ref); err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	res.Done = true
+	return res
+}
+
+// pickRemote escolhe o remoto do push: origin quando existe, senão o primeiro
+// configurado. Repositório sem remoto devolve "".
+func pickRemote(out string) string {
+	first := ""
+	for _, n := range strings.Fields(out) {
+		if n == "origin" {
+			return n
+		}
+		if first == "" {
+			first = n
+		}
+	}
+	return first
 }
 
 // DetachTo move uma worktree destacada para outro commit (somente se limpa).

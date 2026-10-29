@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"devpipe/internal/cryptx"
 	"devpipe/internal/domain"
 	"devpipe/internal/gittest"
 	"devpipe/internal/pipeline"
@@ -27,6 +28,11 @@ func newTestServer(t *testing.T) (http.Handler, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	k, err := cryptx.Open(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.UseKeeper(k)
 	reg := provider.NewRegistry()
 	eng := pipeline.New(st, reg, pipeline.NewBus(), tmp)
 	repo := filepath.Join(tmp, "repos", "r")

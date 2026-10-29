@@ -79,20 +79,28 @@ func (e *Engine) ApproveSpec(id int64, editedSpec string) error {
 	return nil
 }
 
-// ApproveReview conclui a demanda após inspeção humana. Não faz merge nem push.
-func (e *Engine) ApproveReview(id int64, note string) error {
+// ApproveReview conclui a demanda após inspeção humana e devolve a mensagem
+// do que foi feito no Git. Nunca faz merge: o commit fica na branch de
+// trabalho e, se o projeto tiver "publicar ao aprovar" ligado, ela é enviada
+// ao servidor — o push é a única escrita fora da máquina e depende desta
+// aprovação humana.
+func (e *Engine) ApproveReview(id int64, note string) (string, error) {
 	d, err := e.load(id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if d.Stage != domain.StageReview {
-		return errors.New("somente demandas em Revisão podem ser aprovadas")
+		return "", errors.New("somente demandas em Revisão podem ser aprovadas")
+	}
+	p, err := e.st.GetProject(d.ProjectID)
+	if err != nil {
+		return "", err
 	}
 	aplicado := ""
 	if d.DirectBranch {
 		// leva as alterações para a branch selecionada; se falhar, continua em Revisão
 		if aplicado, err = e.ApplyToBranch(id); err != nil {
-			return err
+			return "", err
 		}
 	}
 	d.Stage, d.Status, d.Progress = domain.StageDone, domain.StatusDone, 100
@@ -100,10 +108,24 @@ func (e *Engine) ApproveReview(id int64, note string) error {
 	if d.DirectBranch {
 		d.StatusMessage = "Aprovada. " + aplicado
 	}
+	msg := d.StatusMessage
+	// Publicação: a aprovação já aconteceu, então uma falha de rede não
+	// desfaz a conclusão — ela aparece na mensagem e no log, e o botão
+	// "Publicar branch" permite repetir.
+	if p.AutoPush {
+		pmsg, perr := e.push(&d, p)
+		if perr != nil {
+			msg = d.StatusMessage + " " + perr.Error()
+			d.StatusMessage = msg
+		} else {
+			msg = pmsg
+			d.StatusMessage = pmsg
+		}
+	}
 	e.touch(&d, "Revisão aprovada")
 	e.save(&d)
-	e.log(d, 0, domain.LevelOK, "concluido", "Demanda concluída — aprovada na revisão humana. Merge/push não são automáticos.", note)
-	return nil
+	e.log(d, 0, domain.LevelOK, "concluido", "Demanda concluída — aprovada na revisão humana. O merge continua manual.", note)
+	return msg, nil
 }
 
 // NewAdjustment registra uma devolução para ajustes como nova revisão.

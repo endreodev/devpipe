@@ -841,11 +841,23 @@ func (e *Engine) RepairEncoding(id int64) (encx.Report, error) {
 	}
 	e.log(d, 0, level, "codificacao", msg, det.String())
 	if p.AutoCommit && len(repo.ChangedFiles()) > 0 {
-		if sha, err := repo.CommitAll(d.Ticket + ": correção de codificação de caracteres (DevPipe)"); err == nil && sha != "" {
+		if sha, err := repo.CommitAll(d.Ticket + ": correção de codificação de caracteres"); err == nil && sha != "" {
 			e.log(d, 0, domain.LevelOK, "git", "Commit local de reparo criado ("+sha[:min(10, len(sha))]+")", "")
 		}
 	}
 	return rep, nil
+}
+
+// commitMessage monta a mensagem do commit da demanda. Leva só o que descreve
+// a mudança para quem lê o histórico do repositório: ticket, título e, a partir
+// da segunda, o número da revisão. Nada identifica a ferramenta, o provedor de
+// IA ou o fluxo interno — o commit fica no repositório da equipe.
+func commitMessage(d domain.Demand, rev domain.Revision) string {
+	msg := d.Ticket + ": " + d.Title
+	if rev.Number > 1 {
+		msg = fmt.Sprintf("%s (revisão %d)", msg, rev.Number)
+	}
+	return msg
 }
 
 func (e *Engine) commitIfConfigured(rs *runState, p domain.Project, repo gitx.Repo, rev domain.Revision) {
@@ -854,7 +866,7 @@ func (e *Engine) commitIfConfigured(rs *runState, p domain.Project, repo gitx.Re
 		e.log(*d, rs.run.ID, domain.LevelInfo, "git", "Commit automático desativado: alterações mantidas sem commit na worktree", "")
 		return
 	}
-	msg := fmt.Sprintf("%s: %s (revisão %d)\n\nGerado pela esteira DevPipe com %s. Revisão humana pendente.", d.Ticket, d.Title, rev.Number, rs.run.Provider)
+	msg := commitMessage(*d, rev)
 	sha, err := repo.CommitAll(msg)
 	if err != nil {
 		e.log(*d, rs.run.ID, domain.LevelError, "git", "Falha ao criar commit local", err.Error())
@@ -1025,7 +1037,7 @@ func (e *Engine) ApplyToBranch(id int64) (string, error) {
 	if dir == "" {
 		// branch fora de checkout: commit + fast-forward da própria branch
 		if len(wt.ChangedFiles()) > 0 {
-			if _, err := wt.CommitAll(d.Ticket + ": " + d.Title + " (DevPipe)"); err != nil {
+			if _, err := wt.CommitAll(d.Ticket + ": " + d.Title); err != nil {
 				return "", err
 			}
 		}
@@ -1066,7 +1078,7 @@ func (e *Engine) ApplyToBranch(id int64) (string, error) {
 	// O patch não aplica direto porque o checkout tem alterações locais nos
 	// mesmos arquivos: aplica mesmo assim, arquivo a arquivo, com merge de 3
 	// vias. O que não conflita é juntado; o que conflita fica marcado no arquivo.
-	res, merr := (gitx.Repo{Dir: dir}).MergeWorkingTreeFrom(wt, d.BaseCommit)
+	res, merr := (gitx.Repo{Dir: dir}).MergeWorkingTreeFrom(wt, d.BaseCommit, d.Ticket)
 	if merr != nil {
 		e.log(d, 0, domain.LevelError, "git", "Falha ao aplicar as alterações em "+dir, merr.Error()+"\n\nPatch salvo em: "+patchPath)
 		return "", fmt.Errorf("não foi possível aplicar as alterações no checkout %s: %v (patch salvo em %s)", dir, merr, patchPath)

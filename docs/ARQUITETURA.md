@@ -64,7 +64,24 @@ A branch de trabalho segue o padrão da equipe:
 - **TICKET** é usado **como foi digitado**; só os caracteres que o Git recusa em um nome de referência viram `-` (`gitx.sanitizeRefPart`). `CH101010`, `CH-101010` e `ch 101010` geram, respectivamente, `CH101010`, `CH-101010` e `ch-101010`.
 - **`_Desenvolvimento`** (`gitx.DevSuffix`) marca a branch em que a esteira desenvolve.
 
+A branch de **teste** segue a mesma convenção trocando o sufixo pelo alvo escolhido (`gitx.TargetBranchName`):
+
+```
+<TIPO>/<TICKET>_stage                ex.: BUG/CH101010_stage
+<TIPO>/<TICKET>_release              ex.: BUG/CH101010_release
+```
+
 A montagem está em `gitx.BranchName` e é verificada contra o próprio Git (`git check-ref-format`) em `TestBranchNameAceitaPeloGit`. Não existe mais prefixo por projeto: a convenção vale para todos. Demandas cadastradas antes dela ficam sem tipo e são recusadas na preparação com uma mensagem pedindo que o tipo seja escolhido — as que já têm branch continuam com o nome antigo.
+
+### Publicação e envio para teste
+
+As duas únicas escritas fora da máquina do usuário, ambas **a partir de uma ação humana** — nunca do agente, nunca do agendador.
+
+**Publicar a branch de desenvolvimento** (`pipeline.push`, botão "Publicar branch" ou automático ao aprovar a revisão, se o projeto tiver *Publicar ao aprovar*): commita o que restou na área de trabalho e roda `gitx.Repo.Push`, com refspec explícita `refs/heads/<branch>:refs/heads/<branch>` — só a branch da demanda, nunca tags, nunca `--all`, **nunca `--force`**. Se o servidor recusar por não ser avanço, o push falha e o histórico de lá fica intacto (`TestPushNaoReescreveOServidor`). Sem remoto configurado não é erro: não há onde publicar. O resultado marca `demands.pushed`.
+
+**Enviar para teste** (`pipeline.SendToTest`, habilitado só depois de publicada): o usuário escolhe a branch de origem — `stage` ou `release` por padrão, qualquer outra digitando — e confere o nome da branch de teste, sugerido pela convenção e editável. A aplicação atualiza as referências (`Fetch`, nunca `pull`), cria `<TIPO>/<TICKET>_<alvo>` **a partir da ref remota** (o código atual do servidor, não a cópia local atrasada) em uma worktree própria, e transplanta os commits do desenvolvimento com `gitx.CherryPickUnion` em modo **squash**: todos são aplicados em sequência sem commitar entre eles e viram **um commit só**, com a mensagem `<TICKET>: <título>`.
+
+Conflito não interrompe nem deixa marcação no arquivo: a regra da equipe é ficar com o código da origem **e** com as alterações do desenvolvimento, então cada arquivo em conflito é resolvido por **união** (`git merge-file --union`) — nenhum trecho é descartado. O que não dá para unir fica registrado no log para conferência: binário e arquivo inexistente na origem ficam com a versão da demanda; arquivo que a demanda apagou e a origem alterou é **mantido** (a esteira não descarta código alheio). A branch de teste é publicada ao final. O checkout do usuário não é tocado em nenhum momento.
 
 ### Progresso
 
@@ -108,6 +125,7 @@ Banco: `dados/devpipe.db` (WAL, chaves estrangeiras; exige wazero ≥ 1.9.0 com 
 | `runs` | execução por tentativa: provedor, status, etapa, **hash e texto das regras usadas**, sessão do agente, resumo, erro, custo, diff-stat, commit |
 | `events` | log auditável: data/hora, demanda, ticket, projeto, execução, etapa, nível (info, aviso, erro, sucesso, agente, autorização), mensagem, detalhe |
 | `rules` / `rule_history` | regras globais/projeto, pasta de padrões externa + filtro, escopo por diretório/linguagem, obrigatória, prioridade, versão; histórico de cada versão |
+| `db_servers` | conexões de banco cadastradas (catálogo): nome, tipo, host, porta, banco, usuário, **senha cifrada**, observações |
 | `settings` | configuração geral (JSON) |
 | `schema_version` | controle de migrações |
 
@@ -149,7 +167,7 @@ O texto composto recebe um hash SHA-256 (16 caracteres) gravado em cada execuç�
 | Outro site acionar a API local | Escuta só em 127.0.0.1; checagem de `Host` (DNS rebinding); cabeçalho obrigatório `X-DevPipe` e checagem de `Origin` em mutações (CSRF); CSP sem scripts inline |
 | Alterar repositórios não autorizados | Lista de diretórios autorizados; só projetos cadastrados; agente roda com `cwd` na worktree |
 | Perda de trabalho do usuário | Worktree isolada; checkout do usuário nunca muda; sem reset/clean/descartes; branch existente não criada pela demanda nunca é reutilizada |
-| Operações Git perigosas | Feitas apenas pela aplicação (worktree add, commit local); agente proibido de git de escrita; merge/push manuais |
+| Operações Git perigosas | Feitas apenas pela aplicação (worktree add, commit local, push sem `--force`); agente proibido de git de escrita; merge sempre manual; push só por ação humana |
 | Comandos destrutivos / rede | Classificação (leitura, alteração, teste/build, instalação, rede, destrutivo); validação bloqueia destrutivo e rede; prefixos liberados ao agente não aceitam encadeamento (`; & | $ \``) |
 | Prompt injection em documentos/código | Conteúdo externo delimitado como `<documento_nao_confiavel>` (não pode ser fechado pelo conteúdo); política de segurança com precedência máxima; o agente deve relatar tentativas como "Alerta de segurança" |
 | Vazamento de segredos | Redação de chaves (Anthropic, OpenAI, GitHub, Slack, AWS), `Bearer`, `senha=`/`token=`, credenciais em URLs e chaves privadas antes de gravar eventos e diffs |

@@ -165,7 +165,7 @@ func TestFullCycleWithFixAndAdjustment(t *testing.T) {
 	if len(revs) != 2 || revs[0].Instructions == revs[1].Instructions {
 		t.Fatal("histórico de revisões incorreto")
 	}
-	if err := e.ApproveReview(d.ID, ""); err != nil {
+	if _, err := e.ApproveReview(d.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = st.GetDemand(d.ID)
@@ -260,5 +260,62 @@ func TestWorktreeRootConfiguravel(t *testing.T) {
 	d.WorktreePath = filepath.FromSlash("/antigo/p7/42-CH-1")
 	if got := e.worktreePath(domain.Settings{WorktreeRoot: filepath.FromSlash("/trabalho")}, p, d); got != d.WorktreePath {
 		t.Fatalf("demanda existente deveria manter o caminho: %s", got)
+	}
+}
+
+// Nada do que a esteira grava no repositório da equipe pode identificar a
+// ferramenta: a mensagem de commit é a que o time lê no histórico.
+func TestMensagensDeCommitNaoCitamAFerramenta(t *testing.T) {
+	e, st, p := setup(t, fakeAgent)
+	d := domain.Demand{Ticket: "CH101010", Kind: domain.KindBug, Title: "Corrigir cálculo", ProjectID: p.ID, Provider: "generico"}
+	if _, err := st.CreateDemand(&d, "corrigir"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Enqueue(d.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := waitFor(t, st, d.ID, func(x domain.Demand) bool {
+		return (x.Stage == domain.StageReview || x.Stage == domain.StageBlocked) && !e.IsRunning(x.ID)
+	})
+	if got.Stage != domain.StageReview {
+		t.Fatalf("não chegou à revisão: %s %s", got.Stage, got.StatusMessage)
+	}
+	c := exec.Command("git", "log", "-1", "--format=%s%n%b%n%an <%ae>")
+	c.Dir = got.WorktreePath
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v %s", err, out)
+	}
+	msg := string(out)
+	if strings.Contains(strings.ToLower(msg), "devpipe") || strings.Contains(strings.ToLower(msg), "esteira") {
+		t.Fatalf("o commit cita a ferramenta:\n%s", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "generico") || strings.Contains(strings.ToLower(msg), "revisão humana") {
+		t.Fatalf("o commit cita o provedor ou o fluxo interno:\n%s", msg)
+	}
+	if !strings.HasPrefix(msg, "CH101010: Corrigir cálculo") {
+		t.Fatalf("mensagem inesperada:\n%s", msg)
+	}
+}
+
+func TestCommitMessage(t *testing.T) {
+	d := domain.Demand{Ticket: "CH101010", Title: "Corrigir cálculo do benefício"}
+	casos := []struct {
+		rev  int
+		quer string
+	}{
+		{1, "CH101010: Corrigir cálculo do benefício"},
+		{3, "CH101010: Corrigir cálculo do benefício (revisão 3)"},
+	}
+	for _, c := range casos {
+		got := commitMessage(d, domain.Revision{Number: c.rev})
+		if got != c.quer {
+			t.Errorf("revisão %d: obtido %q, queria %q", c.rev, got, c.quer)
+		}
+		for _, proibido := range []string{"DevPipe", "devpipe", "esteira", "IA", "Revisão humana"} {
+			if strings.Contains(got, proibido) {
+				t.Errorf("a mensagem contém %q: %q", proibido, got)
+			}
+		}
 	}
 }

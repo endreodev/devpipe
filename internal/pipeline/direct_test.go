@@ -53,7 +53,7 @@ func TestDirectBranchCheckedOut(t *testing.T) {
 	if got.Stage != domain.StageReview {
 		t.Fatalf("ajuste: %s", got.StatusMessage)
 	}
-	if err := e.ApproveReview(d.ID, ""); err != nil {
+	if _, err := e.ApproveReview(d.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(filepath.Join(p.Path, "feature.txt"))
@@ -89,7 +89,7 @@ func TestDirectBranchConflict(t *testing.T) {
 	e.Enqueue(d.ID)
 	waitFor(t, st, d.ID, emRevisao(e, 1))
 	os.WriteFile(filepath.Join(p.Path, "feature.txt"), []byte("meu\n"), 0o644)
-	if err := e.ApproveReview(d.ID, ""); err != nil {
+	if _, err := e.ApproveReview(d.ID, ""); err != nil {
 		t.Fatalf("deveria aplicar mesmo com alterações locais: %v", err)
 	}
 	b, _ := os.ReadFile(filepath.Join(p.Path, "feature.txt"))
@@ -116,7 +116,7 @@ func TestDirectBranchNotCheckedOut(t *testing.T) {
 	if got.Stage != domain.StageReview || got.WorkBranch != "release" {
 		t.Fatalf("%s %s %s", got.Stage, got.WorkBranch, got.StatusMessage)
 	}
-	if err := e.ApproveReview(d.ID, ""); err != nil {
+	if _, err := e.ApproveReview(d.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(p.Path, "feature.txt")); err == nil {

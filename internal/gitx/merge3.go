@@ -28,8 +28,11 @@ type MergeResult struct {
 // conflito no arquivo, para revisão no Visual Studio. Não faz commit nem mexe
 // no índice — tudo aparece como alteração pendente. src deve estar com as
 // alterações no índice (ver PatchSince).
-func (r Repo) MergeWorkingTreeFrom(src Repo, base string) (MergeResult, error) {
+func (r Repo) MergeWorkingTreeFrom(src Repo, base, rotulo string) (MergeResult, error) {
 	var res MergeResult
+	if strings.TrimSpace(rotulo) == "" {
+		rotulo = "demanda"
+	}
 	raw, err := src.gitRaw("-c", "core.quotepath=false", "diff", "--cached", "--no-renames", "--name-status", "-z", base)
 	if err != nil {
 		return res, err
@@ -37,7 +40,7 @@ func (r Repo) MergeWorkingTreeFrom(src Repo, base string) (MergeResult, error) {
 	parts := splitZ(raw)
 	for i := 0; i+1 < len(parts); i += 2 {
 		p := parts[i+1]
-		if err := r.merge3File(src, base, p, &res); err != nil {
+		if err := r.merge3File(src, base, p, rotulo, &res); err != nil {
 			return res, fmt.Errorf("%s: %v", p, err)
 		}
 	}
@@ -65,7 +68,7 @@ func isBinary(bs ...[]byte) bool {
 	return false
 }
 
-func (r Repo) merge3File(src Repo, base, p string, res *MergeResult) error {
+func (r Repo) merge3File(src Repo, base, p, rotulo string, res *MergeResult) error {
 	oursPath := filepath.Join(r.Dir, filepath.FromSlash(p))
 	ours, oursOK := readOpt(oursPath)
 	theirs, theirsOK := readOpt(filepath.Join(src.Dir, filepath.FromSlash(p)))
@@ -106,13 +109,13 @@ func (r Repo) merge3File(src Repo, base, p string, res *MergeResult) error {
 		baseB = nil // arquivo novo dos dois lados: merge com base vazia
 	}
 	if isBinary(ours, theirs, baseB) {
-		if err := os.WriteFile(oursPath+".devpipe", theirs, 0o644); err != nil {
+		if err := os.WriteFile(oursPath+SufixoBinario, theirs, 0o644); err != nil {
 			return err
 		}
-		res.Kept = append(res.Kept, p+" (binário alterado dos dois lados: versão da demanda salva em "+p+".devpipe)")
+		res.Kept = append(res.Kept, p+" (binário alterado dos dois lados: versão da demanda salva em "+p+SufixoBinario+")")
 		return nil
 	}
-	merged, conflitos, err := mergeFile(ours, baseB, theirs)
+	merged, conflitos, err := mergeFile(ours, baseB, theirs, rotulo)
 	if err != nil {
 		return err
 	}
@@ -138,11 +141,31 @@ func fileMode(path string) os.FileMode {
 	return 0o644
 }
 
+// Rótulos que aparecem DENTRO dos arquivos do usuário (marcação de conflito)
+// e no nome do arquivo auxiliar. Nada aqui pode identificar a ferramenta: é
+// conteúdo que fica no repositório e vai para o commit de quem resolver.
 const rotuloLocal = "Seu checkout (alterações locais)"
+
+// SufixoBinario nomeia a cópia deixada quando um binário mudou dos dois lados.
+const SufixoBinario = ".da-demanda"
 
 // mergeFile roda "git merge-file -p" e devolve o resultado e a quantidade de
 // conflitos (o git sai com código = nº de conflitos).
-func mergeFile(ours, base, theirs []byte) ([]byte, int, error) {
+func mergeFile(ours, base, theirs []byte, rotulo string) ([]byte, int, error) {
+	return mergeFileArgs(ours, base, theirs,
+		"-L", rotuloLocal, "-L", "base da demanda", "-L", rotulo+" (demanda)")
+}
+
+// mergeFileUnion une os dois lados sem marcação de conflito: nos trechos em
+// que ambos mudaram, o resultado fica com o conteúdo dos dois. É como a
+// branch de teste recebe o código da origem (stage/release) E as alterações
+// do desenvolvimento — ver CherryPickUnion.
+func mergeFileUnion(ours, base, theirs []byte) ([]byte, error) {
+	out, _, err := mergeFileArgs(ours, base, theirs, "--union")
+	return out, err
+}
+
+func mergeFileArgs(ours, base, theirs []byte, extra ...string) ([]byte, int, error) {
 	dir, err := os.MkdirTemp("", "devpipe-merge-")
 	if err != nil {
 		return nil, 0, err
@@ -156,16 +179,16 @@ func mergeFile(ours, base, theirs []byte) ([]byte, int, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "merge-file", "-p",
-		"-L", rotuloLocal, "-L", "base da demanda", "-L", "DevPipe (demanda)",
-		"ours", "base", "theirs")
+	args := append([]string{"merge-file", "-p"}, extra...)
+	args = append(args, "ours", "base", "theirs")
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	hideWindow(cmd)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err = cmd.Run()
-	Log("git merge-file -p", "", err)
+	Log("git "+strings.Join(args, " "), "", err)
 	if err == nil {
 		return out.Bytes(), 0, nil
 	}

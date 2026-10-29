@@ -43,3 +43,30 @@ func TestResumedPromptsSkipContext(t *testing.T) {
 		t.Fatal("correção em sessão nova precisa das regras")
 	}
 }
+
+// O código gerado fica no repositório da equipe: o prompt precisa proibir
+// explicitamente que a IA assine o trabalho em comentários.
+func TestPromptProibeAssinaturaDaFerramenta(t *testing.T) {
+	c := promptCtx{D: domain.Demand{Ticket: "CH101010", Title: "T"}, P: domain.Project{Name: "P"}}
+	dev := developPrompt(c, "spec")
+	for _, termo := range []string{"comentário", "ferramenta automatizada", "por IA"} {
+		if !strings.Contains(dev, termo) {
+			t.Errorf("o prompt de desenvolvimento não contém %q", termo)
+		}
+	}
+}
+
+// Nenhum prompt pode levar o nome da ferramenta para dentro da sessão do
+// agente — é de lá que sairiam os comentários no código.
+func TestPromptsNaoCitamAFerramenta(t *testing.T) {
+	c := promptCtx{D: domain.Demand{Ticket: "CH101010", Title: "T"}, P: domain.Project{Name: "P"}, Rules: "regras"}
+	for nome, p := range map[string]string{
+		"analise":         analysisPrompt(c),
+		"desenvolvimento": developPrompt(c, "spec"),
+		"correcao":        fixPrompt(c, "spec", "saida", 1),
+	} {
+		if strings.Contains(strings.ToLower(p), "devpipe") {
+			t.Errorf("o prompt de %s cita a ferramenta", nome)
+		}
+	}
+}

@@ -9,11 +9,23 @@ import (
 	"fmt"
 	"time"
 
+	"devpipe/internal/cryptx"
+
 	_ "github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db *sql.DB
+	// keeper cifra/decifra os segredos gravados (senhas dos servidores de
+	// banco). Fica aqui, e não na camada web, para que "cifrado em repouso"
+	// seja garantido na fronteira da persistência: não existe caminho que
+	// grave um segredo sem passar por ele.
+	keeper *cryptx.Keeper
+}
+
+// UseKeeper liga o cofre de segredos à store (chamado na inicialização).
+func (s *Store) UseKeeper(k *cryptx.Keeper) { s.keeper = k }
 
 var ErrNotFound = errors.New("registro não encontrado")
 
@@ -181,6 +193,31 @@ var migrations = []string{
 	// Tipo da demanda (BUG|FIX|NR): primeiro segmento da branch de trabalho.
 	// Demandas anteriores ficam com '' — a branch delas já existe.
 	`ALTER TABLE demands ADD COLUMN kind TEXT DEFAULT '';`,
+	// Catálogo de servidores de banco. password_enc guarda a senha cifrada
+	// (internal/cryptx); nunca texto puro.
+	`CREATE TABLE db_servers (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		kind TEXT DEFAULT 'sqlserver',
+		host TEXT DEFAULT '',
+		port INTEGER DEFAULT 0,
+		database TEXT DEFAULT '',
+		username TEXT DEFAULT '',
+		password_enc TEXT DEFAULT '',
+		notes TEXT DEFAULT '',
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL
+	);
+	ALTER TABLE projects ADD COLUMN db_server_id INTEGER DEFAULT 0;`,
+	// Publicar a branch de trabalho no servidor ao aprovar a revisão humana.
+	// Desligado por padrão, inclusive nos projetos já cadastrados: push é a
+	// única escrita fora da máquina e precisa ser habilitado de propósito.
+	`ALTER TABLE projects ADD COLUMN auto_push INTEGER DEFAULT 0;`,
+	// Publicação da branch de desenvolvimento e branch de teste criada a
+	// partir dela (ver pipeline.SendToTest).
+	`ALTER TABLE demands ADD COLUMN pushed INTEGER DEFAULT 0;
+	 ALTER TABLE demands ADD COLUMN test_branch TEXT DEFAULT '';
+	 ALTER TABLE demands ADD COLUMN test_target TEXT DEFAULT '';`,
 }
 
 func (s *Store) migrate() error {

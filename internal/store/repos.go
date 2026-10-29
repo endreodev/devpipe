@@ -16,15 +16,15 @@ import (
 // projectCols nao inclui branch_prefix: o nome da branch passou a seguir a
 // convencao <TIPO>/<TICKET>_Desenvolvimento (ver gitx.BranchName). A coluna
 // continua no banco com os valores antigos, apenas sem uso.
-const projectCols = `id,name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,auto_commit,file_encoding,created_at,updated_at`
+const projectCols = `id,name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,COALESCE(db_server_id,0),auto_commit,COALESCE(auto_push,0),file_encoding,created_at,updated_at`
 
 func scanProject(r interface{ Scan(...any) error }) (domain.Project, error) {
 	var p domain.Project
 	var bo, sf, ab string
-	var ac int
-	err := r.Scan(&p.ID, &p.Name, &p.Path, &p.Language, &p.MainSolution, &bo, &sf, &p.ExtraRules, &p.BuildCommand, &p.TestCommand, &ab, &ac, &p.FileEncoding, &p.CreatedAt, &p.UpdatedAt)
+	var ac, ap int
+	err := r.Scan(&p.ID, &p.Name, &p.Path, &p.Language, &p.MainSolution, &bo, &sf, &p.ExtraRules, &p.BuildCommand, &p.TestCommand, &ab, &p.DBServerID, &ac, &ap, &p.FileEncoding, &p.CreatedAt, &p.UpdatedAt)
 	p.BranchOptions, p.StandardsFiles, p.AgentBashAllow = fromJSONList(bo), fromJSONList(sf), fromJSONList(ab)
-	p.AutoCommit = ac == 1
+	p.AutoCommit, p.AutoPush = ac == 1, ap == 1
 	return p, err
 }
 
@@ -61,8 +61,8 @@ func (s *Store) SaveProject(p *domain.Project) error {
 	if p.ID == 0 {
 		p.CreatedAt = t
 		p.UpdatedAt = t
-		res, err := s.db.Exec(`INSERT INTO projects(name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,auto_commit,file_encoding,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), b2i(p.AutoCommit), p.FileEncoding, t, t)
+		res, err := s.db.Exec(`INSERT INTO projects(name,path,language,main_solution,branch_options,standards_files,extra_rules,build_command,test_command,agent_bash_allow,db_server_id,auto_commit,auto_push,file_encoding,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.DBServerID, b2i(p.AutoCommit), b2i(p.AutoPush), p.FileEncoding, t, t)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return fmt.Errorf("já existe um projeto cadastrado com este caminho")
@@ -73,8 +73,8 @@ func (s *Store) SaveProject(p *domain.Project) error {
 		return nil
 	}
 	p.UpdatedAt = t
-	_, err := s.db.Exec(`UPDATE projects SET name=?,path=?,language=?,main_solution=?,branch_options=?,standards_files=?,extra_rules=?,build_command=?,test_command=?,agent_bash_allow=?,auto_commit=?,file_encoding=?,updated_at=? WHERE id=?`,
-		p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), b2i(p.AutoCommit), p.FileEncoding, t, p.ID)
+	_, err := s.db.Exec(`UPDATE projects SET name=?,path=?,language=?,main_solution=?,branch_options=?,standards_files=?,extra_rules=?,build_command=?,test_command=?,agent_bash_allow=?,db_server_id=?,auto_commit=?,auto_push=?,file_encoding=?,updated_at=? WHERE id=?`,
+		p.Name, p.Path, p.Language, p.MainSolution, toJSON(nz(p.BranchOptions)), toJSON(nz(p.StandardsFiles)), p.ExtraRules, p.BuildCommand, p.TestCommand, toJSON(nz(p.AgentBashAllow)), p.DBServerID, b2i(p.AutoCommit), b2i(p.AutoPush), p.FileEncoding, t, p.ID)
 	return err
 }
 
@@ -97,15 +97,16 @@ func nz(v []string) []string {
 
 // ---------- Demandas ----------
 
-const demandCols = `d.id,d.ticket,COALESCE(d.kind,''),d.title,d.summary,d.project_id,COALESCE(p.name,''),d.priority,d.queue_order,d.notes,d.base_branch,d.work_branch,d.worktree_path,d.provider,d.model,d.review_spec,d.stage,d.blocked_from,d.status,d.status_message,d.progress,d.attempts,d.validation_state,d.current_revision,d.last_activity,d.last_activity_at,d.elapsed_seconds,d.started_at,d.created_at,d.updated_at,COALESCE(d.direct_branch,0),COALESCE(d.base_commit,'')`
+const demandCols = `d.id,d.ticket,COALESCE(d.kind,''),d.title,d.summary,d.project_id,COALESCE(p.name,''),d.priority,d.queue_order,d.notes,d.base_branch,d.work_branch,d.worktree_path,d.provider,d.model,d.review_spec,d.stage,d.blocked_from,d.status,d.status_message,d.progress,d.attempts,d.validation_state,d.current_revision,d.last_activity,d.last_activity_at,d.elapsed_seconds,d.started_at,d.created_at,d.updated_at,COALESCE(d.direct_branch,0),COALESCE(d.base_commit,''),COALESCE(d.pushed,0),COALESCE(d.test_branch,''),COALESCE(d.test_target,'')`
 
 func scanDemand(r interface{ Scan(...any) error }) (domain.Demand, error) {
 	var d domain.Demand
-	var rs, direta int
+	var rs, direta, publicada int
 	var la, st sql.NullTime
-	err := r.Scan(&d.ID, &d.Ticket, &d.Kind, &d.Title, &d.Summary, &d.ProjectID, &d.ProjectName, &d.Priority, &d.QueueOrder, &d.Notes, &d.BaseBranch, &d.WorkBranch, &d.WorktreePath, &d.Provider, &d.Model, &rs, &d.Stage, &d.BlockedFrom, &d.Status, &d.StatusMessage, &d.Progress, &d.Attempts, &d.ValidationState, &d.CurrentRevision, &d.LastActivity, &la, &d.ElapsedSeconds, &st, &d.CreatedAt, &d.UpdatedAt, &direta, &d.BaseCommit)
+	err := r.Scan(&d.ID, &d.Ticket, &d.Kind, &d.Title, &d.Summary, &d.ProjectID, &d.ProjectName, &d.Priority, &d.QueueOrder, &d.Notes, &d.BaseBranch, &d.WorkBranch, &d.WorktreePath, &d.Provider, &d.Model, &rs, &d.Stage, &d.BlockedFrom, &d.Status, &d.StatusMessage, &d.Progress, &d.Attempts, &d.ValidationState, &d.CurrentRevision, &d.LastActivity, &la, &d.ElapsedSeconds, &st, &d.CreatedAt, &d.UpdatedAt, &direta, &d.BaseCommit, &publicada, &d.TestBranch, &d.TestTarget)
 	d.ReviewSpec = rs == 1
 	d.DirectBranch = direta == 1
+	d.Pushed = publicada == 1
 	if la.Valid {
 		t := la.Time
 		d.LastActivityAt = &t
@@ -226,8 +227,8 @@ func (s *Store) UpdateDemandFields(d domain.Demand) error {
 
 // UpdateDemandState persiste o estado de execução (usado pelo orquestrador).
 func (s *Store) UpdateDemandState(d domain.Demand) error {
-	_, err := s.db.Exec(`UPDATE demands SET stage=?,blocked_from=?,status=?,status_message=?,progress=?,attempts=?,validation_state=?,current_revision=?,work_branch=?,worktree_path=?,base_commit=?,last_activity=?,last_activity_at=?,elapsed_seconds=?,started_at=?,updated_at=? WHERE id=?`,
-		d.Stage, d.BlockedFrom, d.Status, d.StatusMessage, d.Progress, d.Attempts, d.ValidationState, d.CurrentRevision, d.WorkBranch, d.WorktreePath, d.BaseCommit, d.LastActivity, d.LastActivityAt, d.ElapsedSeconds, d.StartedAt, now(), d.ID)
+	_, err := s.db.Exec(`UPDATE demands SET stage=?,blocked_from=?,status=?,status_message=?,progress=?,attempts=?,validation_state=?,current_revision=?,work_branch=?,worktree_path=?,base_commit=?,pushed=?,test_branch=?,test_target=?,last_activity=?,last_activity_at=?,elapsed_seconds=?,started_at=?,updated_at=? WHERE id=?`,
+		d.Stage, d.BlockedFrom, d.Status, d.StatusMessage, d.Progress, d.Attempts, d.ValidationState, d.CurrentRevision, d.WorkBranch, d.WorktreePath, d.BaseCommit, b2i(d.Pushed), d.TestBranch, d.TestTarget, d.LastActivity, d.LastActivityAt, d.ElapsedSeconds, d.StartedAt, now(), d.ID)
 	return err
 }
 
@@ -706,4 +707,134 @@ func parseDBTime(v any) (time.Time, bool) {
 		return parseDBTime(string(x))
 	}
 	return time.Time{}, false
+}
+
+// ---------- Servidores de banco ----------
+//
+// Catálogo para consulta humana: o DevPipe não conecta no banco nem repassa
+// estes dados ao agente ou aos comandos de validação. A senha é gravada
+// cifrada (internal/cryptx) e só sai daqui pelo DBServerPassword, que é a
+// ação explícita de revelar.
+
+const dbServerCols = `id,name,kind,host,port,database,username,password_enc,notes,created_at,updated_at`
+
+func scanDBServer(r interface{ Scan(...any) error }) (domain.DBServer, error) {
+	var d domain.DBServer
+	var enc string
+	err := r.Scan(&d.ID, &d.Name, &d.Kind, &d.Host, &d.Port, &d.Database, &d.Username, &enc, &d.Notes, &d.CreatedAt, &d.UpdatedAt)
+	d.HasPassword = enc != "" // a senha em si nunca sobe junto com a listagem
+	return d, err
+}
+
+func (s *Store) ListDBServers() ([]domain.DBServer, error) {
+	rows, err := s.db.Query(`SELECT ` + dbServerCols + ` FROM db_servers ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.DBServer{}
+	for rows.Next() {
+		d, err := scanDBServer(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetDBServer(id int64) (domain.DBServer, error) {
+	d, err := scanDBServer(s.db.QueryRow(`SELECT `+dbServerCols+` FROM db_servers WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return d, ErrNotFound
+	}
+	return d, err
+}
+
+// SaveDBServer grava a conexão. Senha vazia na edição MANTÉM a que já existe —
+// assim a tela pode exibir o campo em branco (nunca devolvemos a senha) sem
+// apagar o segredo a cada gravação. Para remover, use ClearDBServerPassword.
+func (s *Store) SaveDBServer(d *domain.DBServer) error {
+	if s.keeper == nil {
+		return errors.New("cofre de segredos não inicializado")
+	}
+	t := now()
+	if d.Kind == "" {
+		d.Kind = "sqlserver"
+	}
+	if d.ID == 0 {
+		enc, err := s.keeper.Encrypt(d.Password)
+		if err != nil {
+			return err
+		}
+		d.CreatedAt, d.UpdatedAt = t, t
+		res, err := s.db.Exec(`INSERT INTO db_servers(name,kind,host,port,database,username,password_enc,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			d.Name, d.Kind, d.Host, d.Port, d.Database, d.Username, enc, d.Notes, t, t)
+		if err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") {
+				return fmt.Errorf("já existe uma conexão com o nome %q", d.Name)
+			}
+			return err
+		}
+		d.ID, _ = res.LastInsertId()
+		d.HasPassword = d.Password != ""
+		d.Password = ""
+		return nil
+	}
+	d.UpdatedAt = t
+	if d.Password == "" {
+		_, err := s.db.Exec(`UPDATE db_servers SET name=?,kind=?,host=?,port=?,database=?,username=?,notes=?,updated_at=? WHERE id=?`,
+			d.Name, d.Kind, d.Host, d.Port, d.Database, d.Username, d.Notes, t, d.ID)
+		if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+			return fmt.Errorf("já existe uma conexão com o nome %q", d.Name)
+		}
+		if err == nil {
+			atual, _ := s.GetDBServer(d.ID)
+			d.HasPassword = atual.HasPassword
+		}
+		return err
+	}
+	enc, err := s.keeper.Encrypt(d.Password)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE db_servers SET name=?,kind=?,host=?,port=?,database=?,username=?,password_enc=?,notes=?,updated_at=? WHERE id=?`,
+		d.Name, d.Kind, d.Host, d.Port, d.Database, d.Username, enc, d.Notes, t, d.ID)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+		return fmt.Errorf("já existe uma conexão com o nome %q", d.Name)
+	}
+	d.HasPassword, d.Password = true, ""
+	return err
+}
+
+// DBServerPassword decifra e devolve a senha guardada. É o único caminho de
+// saída do segredo — quem chama deve registrar o acesso.
+func (s *Store) DBServerPassword(id int64) (string, error) {
+	if s.keeper == nil {
+		return "", errors.New("cofre de segredos não inicializado")
+	}
+	var enc string
+	err := s.db.QueryRow(`SELECT password_enc FROM db_servers WHERE id=?`, id).Scan(&enc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return s.keeper.Decrypt(enc)
+}
+
+func (s *Store) ClearDBServerPassword(id int64) error {
+	_, err := s.db.Exec(`UPDATE db_servers SET password_enc='',updated_at=? WHERE id=?`, now(), id)
+	return err
+}
+
+func (s *Store) DeleteDBServer(id int64) error {
+	var n int
+	s.db.QueryRow(`SELECT COUNT(*) FROM projects WHERE db_server_id=?`, id).Scan(&n)
+	if n > 0 {
+		return fmt.Errorf("a conexão está vinculada a %d projeto(s); desvincule antes de excluir", n)
+	}
+	_, err := s.db.Exec(`DELETE FROM db_servers WHERE id=?`, id)
+	return err
 }

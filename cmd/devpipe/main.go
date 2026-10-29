@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"devpipe/internal/cryptx"
 	"devpipe/internal/encx"
 	"devpipe/internal/gitx"
 	"devpipe/internal/pipeline"
@@ -90,6 +91,14 @@ func main() {
 		log.Fatalf("banco de dados: %v", err)
 	}
 	defer st.Close()
+
+	// Cofre dos segredos gravados (senhas dos servidores de banco). A chave
+	// fica num arquivo separado do devpipe.db, na mesma pasta de dados.
+	keeper, err := cryptx.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("cofre de segredos: %v", err)
+	}
+	st.UseKeeper(keeper)
 
 	settings, _ := st.GetSettings()
 	reg := provider.NewRegistry()

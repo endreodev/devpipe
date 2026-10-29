@@ -55,9 +55,15 @@ demo/              projeto JS e demanda de exemplo para ponta a ponta
 
 `Engine.process` (`internal/pipeline/engine.go`, ~1200 linhas) é o coração: cria a worktree **antes** da análise, roda o agente em modo somente leitura para gerar a especificação, continua a **mesma sessão** (`--resume`) no desenvolvimento, executa build/testes pela aplicação (não pelo agente) e, em falha, chama o ciclo de correção N vezes. O agendador respeita `maxParallel` e um **lock por repositório** (`repoKey`).
 
+### Envio para teste
+
+Depois de publicada a branch de desenvolvimento, `Engine.SendToTest` cria `<TIPO>/<TICKET>_<alvo>` (ex.: `BUG/CH101010_stage`) a partir da branch de origem escolhida pelo usuário — `stage`, `release` ou outra, conforme o projeto. O nome é sugerido na tela (`TestBranchSuggestion`) e pode ser trocado; o que vier é normalizado por `gitx.NormalizeBranchName`. A origem é atualizada antes (`Fetch`) e a branch nasce da **ref remota**, não da cópia local. Os commits do desenvolvimento vão por `gitx.CherryPickUnion` em worktree própria, **sempre com squash**: aplicados em sequência sem commitar entre eles e reunidos em **um commit** com a mensagem de `commitMessage` — o histórico detalhado fica na branch de desenvolvimento.
+
+Conflito é resolvido por **união** (`git merge-file --union`): o arquivo fica com o código da origem **e** com as alterações do desenvolvimento, sem marcação de conflito e sem descartar nenhum lado. Binário e arquivo que não existe na origem ficam com a versão da demanda; arquivo que a demanda apagou e a origem alterou é mantido. Tudo o que foi resolvido automaticamente vai para o log do evento. Ao mexer nisso, rode `internal/gitx` (`TestCherryPickUniaoMantemOsDoisLados`) e `internal/pipeline/publicacao_test.go`.
+
 ### Convenção de nomes de branch
 
-`<TIPO>/<TICKET>_Desenvolvimento` — ex.: `BUG/CH101010_Desenvolvimento`. O tipo (`BUG` erro, `FIX` chamado urgente, `NR` novo requisito) é campo obrigatório da demanda (`Demand.Kind`, constantes em `internal/domain`); o ticket entra como foi digitado, com apenas os caracteres recusados pelo Git trocados por `-`. Tudo é montado em `gitx.BranchName`, com o sufixo em `gitx.DevSuffix`. Não existe prefixo por projeto — o campo antigo saiu do cadastro (a coluna `branch_prefix` continua no banco, sem uso). Ao mexer nisso, rode `internal/gitx` (há um teste que valida os nomes com `git check-ref-format`).
+`<TIPO>/<TICKET>_Desenvolvimento` — ex.: `BUG/CH101010_Desenvolvimento`; a branch de teste troca o sufixo pelo alvo (`BUG/CH101010_stage`, `gitx.TargetBranchName`). O tipo (`BUG` erro, `FIX` chamado urgente, `NR` novo requisito) é campo obrigatório da demanda (`Demand.Kind`, constantes em `internal/domain`); o ticket entra como foi digitado, com apenas os caracteres recusados pelo Git trocados por `-`. Tudo é montado em `gitx.BranchName`, com o sufixo em `gitx.DevSuffix`. Não existe prefixo por projeto — o campo antigo saiu do cadastro (a coluna `branch_prefix` continua no banco, sem uso). Ao mexer nisso, rode `internal/gitx` (há um teste que valida os nomes com `git check-ref-format`).
 
 ### Atualização do código ao escolher o projeto
 
@@ -65,9 +71,33 @@ Ao selecionar o projeto no cadastro da demanda (`GET /api/projects/{id}/branches
 
 Com as refs em dia, `Branches()` informa `upstream`/`ahead`/`behind` de cada branch local, a tela mostra o atraso, e a remota correspondente (ex.: `origin/main`) **permanece na lista quando a local está atrasada** — é por ela que a demanda parte do código atual do servidor sem alterar nada no checkout. `inspect` já sugere a remota como base nesse caso. Sem remoto configurado, o fetch é pulado sem erro. Testes em `internal/gitx` cobrem os três casos (atualiza sem tocar no checkout, sem remoto, remota mantida quando a local está atrasada).
 
+### Segredos gravados (`internal/cryptx`)
+
+Há um único tipo de segredo guardado pelo DevPipe: a senha das **conexões de banco cadastradas** (`db_servers`), que são um **catálogo para consulta humana** — a aplicação não conecta no banco, não repassa esses dados ao agente e não os injeta nos comandos de validação.
+
+A senha é cifrada com AES-256-GCM (`cryptx.Keeper`); a chave fica em `<dados>/chave.bin` (32 bytes, criada na primeira execução, permissão restrita). Isso protege contra cópia do `devpipe.db` — inclusive os backups que ficam na própria pasta de dados — e **não** contra quem tem acesso de leitura à pasta inteira; a interface diz isso ao usuário. O cofre é ligado à store em `main` (`st.UseKeeper`): sem ele, gravar uma conexão falha com erro em vez de gravar texto puro.
+
+A senha nunca sai em listagem (`DBServer.HasPassword` indica apenas que existe). O único caminho de saída é `POST /api/db-servers/{id}/reveal`, que registra um evento de autorização no log. Ao editar, senha em branco **mantém** a atual; para remover existe `clear-password`. Ao acrescentar segredo novo, passe por `cryptx` e mantenha essas duas regras (nunca em listagem, acesso registrado).
+
+### Nada identifica a ferramenta dentro do repositório da equipe
+
+O que o DevPipe grava no repositório do cliente — mensagem de commit, autor, marcação de conflito, arquivos auxiliares — **não pode citar o DevPipe, a esteira, o provedor de IA nem o fluxo interno**. Esse texto fica no histórico do projeto e é lido pelo time.
+
+Pontos que obedecem a isso (há teste para cada um):
+
+- `pipeline.commitMessage` — `CH101010: Título` e, a partir da segunda revisão, `(revisão N)`. Nada além disso.
+- Commit do reparo de codificação e da aplicação na branch — só ticket e descrição.
+- `gitx.Repo.Init` — mensagem `Commit inicial`; sem identidade Git na máquina, o autor cai em `Desenvolvimento <desenvolvimento@localhost>` (ou no autor configurado), nunca no nome da ferramenta.
+- `gitx.Repo.MergeWorkingTreeFrom` recebe um rótulo (o ticket) e o usa na marcação de conflito: `>>>>>>> CH101010 (demanda)`. O arquivo deixado quando um binário muda dos dois lados usa `gitx.SufixoBinario` (`.da-demanda`).
+- Mensagem de reflog do fast-forward: `fast-forward`.
+- O **prompt de desenvolvimento** proíbe explicitamente que a IA assine o trabalho em comentário, docstring, TODO ou changelog — é ela quem escreve os comentários no código.
+
+Ao acrescentar qualquer escrita no repositório do usuário, siga a regra e cubra com teste.
+
 ### Invariantes que não podem ser quebradas
 
-- **Nada destrutivo é automático.** A aplicação nunca faz merge, push, reset, rebase, clean, stash ou descarte. O checkout do usuário nunca muda. Commits ficam só na branch de trabalho local.
+- **Nada destrutivo é automático.** A aplicação nunca faz merge, reset, rebase, clean, stash ou descarte. O checkout do usuário nunca muda.
+- **Push só por ação humana e só por avanço.** As duas escritas fora da máquina — publicar a branch de desenvolvimento (`pipeline.push`) e o envio para teste (`pipeline.SendToTest`) — partem de um clique ou da aprovação da revisão com *Publicar ao aprovar* ligado no projeto (`Project.AutoPush`, desligado por padrão). `gitx.Repo.Push` usa refspec explícita de uma única branch e **jamais** `--force`: se o servidor recusar, o histórico de lá fica intacto. O merge continua manual.
 - **O agente nunca executa git de escrita.** `security.AgentDisallowedTools` é fixo e tem precedência sobre qualquer regra, instrução de demanda ou conteúdo de documento. `bypassPermissions` é recusado pela aplicação.
 - **Precedência das regras** (`internal/rules`): política de segurança da aplicação > regras globais obrigatórias > regras do projeto obrigatórias > regras do projeto/padrões do repo > globais recomendadas > instruções da demanda. O texto composto é gravado com hash em cada `run` — ao mudar a composição, lembre que isso é trilha de auditoria.
 - **Conteúdo externo é não confiável:** anexos e código entram no prompt delimitados como `<documento_nao_confiavel>`, com delimitador que o conteúdo não consegue fechar.

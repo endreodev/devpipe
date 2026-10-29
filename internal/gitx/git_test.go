@@ -231,3 +231,69 @@ func TestBranchesMantemRemotaQuandoLocalAtrasada(t *testing.T) {
 		t.Fatal("com a local atrasada, origin/main precisa estar disponível como base")
 	}
 }
+
+// Branch sem upstream é normal e não pode poluir a auditoria: antes, cada
+// branch local sem rastreamento gerava um "fatal: no upstream configured" no
+// devpipe.log toda vez que a tela de cadastro listava as branches.
+func TestBranchSemUpstreamNaoLogaErro(t *testing.T) {
+	dir := t.TempDir()
+	g := func(args ...string) {
+		t.Helper()
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	g("init", "-q", "-b", "main")
+	g("config", "user.email", "t@t")
+	g("config", "user.name", "t")
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("1\n"), 0o644)
+	g("add", ".")
+	g("commit", "-q", "-m", "um")
+
+	original := Log
+	defer func() { Log = original }()
+	var erros []string
+	Log = func(cmd, out string, err error) {
+		if err != nil {
+			erros = append(erros, cmd+" -> "+err.Error())
+		}
+	}
+	bs, err := (Repo{Dir: dir}).Branches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bs) != 1 || bs[0].Name != "main" || bs[0].Upstream != "" {
+		t.Fatalf("branches: %+v", bs)
+	}
+	for _, e := range erros {
+		if strings.Contains(e, "upstream") {
+			t.Fatalf("erro de upstream foi para a auditoria: %s", e)
+		}
+	}
+}
+
+// Repositório criado do zero: o commit inicial e o autor ficam para sempre no
+// histórico do projeto da equipe — não podem identificar a ferramenta.
+func TestCommitInicialNaoCitaAFerramenta(t *testing.T) {
+	// sem identidade Git no repositório, para cair no caminho do autor padrão
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "vazio"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(t.TempDir(), "vazio"))
+	dir := filepath.Join(t.TempDir(), "novo")
+	if _, err := (Repo{Dir: dir}).Init(); err != nil {
+		t.Fatal(err)
+	}
+	c := exec.Command("git", "log", "-1", "--format=%s%n%an <%ae>")
+	c.Dir = dir
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v %s", err, out)
+	}
+	if strings.Contains(strings.ToLower(string(out)), "devpipe") {
+		t.Fatalf("o commit inicial cita a ferramenta:\n%s", out)
+	}
+	if !strings.HasPrefix(string(out), "Commit inicial") {
+		t.Fatalf("mensagem inesperada:\n%s", out)
+	}
+}

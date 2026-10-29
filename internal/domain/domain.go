@@ -67,10 +67,43 @@ type Project struct {
 	BuildCommand   string    `json:"buildCommand"`
 	TestCommand    string    `json:"testCommand"`
 	AgentBashAllow []string  `json:"agentBashAllow"` // prefixos de comando liberados ao agente (ex.: "dotnet build")
+	DBServerID     int64     `json:"dbServerId"`     // conexão de banco cadastrada (0 = nenhuma)
 	AutoCommit     bool      `json:"autoCommit"`
+	AutoPush       bool      `json:"autoPush"`     // publicar a branch de trabalho ao aprovar a revisão
 	FileEncoding   string    `json:"fileEncoding"` // auto | windows-1252 | utf-8 | utf-8-bom (arquivos novos)
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+// Tipos de servidor de banco aceitos no cadastro (apenas rótulo: o DevPipe não
+// conecta, só guarda os dados).
+var DBKinds = []string{"sqlserver", "postgres", "mysql", "oracle", "outro"}
+
+var DBKindLabels = map[string]string{
+	"sqlserver": "SQL Server", "postgres": "PostgreSQL", "mysql": "MySQL/MariaDB",
+	"oracle": "Oracle", "outro": "Outro",
+}
+
+// DBServer é uma conexão de banco cadastrada — um catálogo para consulta
+// humana. O DevPipe NÃO conecta no banco nem repassa estes dados ao agente ou
+// aos comandos de validação.
+//
+// A senha nunca trafega na listagem: Password só é preenchido na entrada (ao
+// salvar) e na ação explícita de revelar. HasPassword diz se existe uma senha
+// guardada, para a interface não confundir "sem senha" com "senha oculta".
+type DBServer struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"` // apelido usado na seleção (ex.: SISPREV_MS)
+	Kind        string    `json:"kind"`
+	Host        string    `json:"host"`
+	Port        int       `json:"port"`
+	Database    string    `json:"database"`
+	Username    string    `json:"username"`
+	Password    string    `json:"password,omitempty"`
+	HasPassword bool      `json:"hasPassword"`
+	Notes       string    `json:"notes"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 // Tipo da demanda. Define o primeiro segmento da branch de trabalho
@@ -113,8 +146,15 @@ type Demand struct {
 	WorkBranch  string `json:"workBranch"`
 	// DirectBranch: trabalhar direto na branch selecionada, sem criar branch nova.
 	// Os commits da demanda são aplicados (fast-forward) na própria branch.
-	DirectBranch    bool       `json:"directBranch"`
-	BaseCommit      string     `json:"baseCommit"` // commit da branch no início da demanda (base do diff)
+	DirectBranch bool   `json:"directBranch"`
+	BaseCommit   string `json:"baseCommit"` // commit da branch no início da demanda (base do diff)
+	// Pushed: a branch de desenvolvimento já foi publicada no servidor.
+	// É o que libera o envio para teste (não se envia o que ninguém vê).
+	Pushed bool `json:"pushed"`
+	// TestBranch/TestTarget: branch de teste criada a partir da origem
+	// escolhida (stage, release...) com os commits da demanda.
+	TestBranch      string     `json:"testBranch"`
+	TestTarget      string     `json:"testTarget"`
 	WorktreePath    string     `json:"worktreePath"`
 	Provider        string     `json:"provider"`
 	Model           string     `json:"model"`

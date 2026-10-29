@@ -8,6 +8,7 @@ const STAGE_COLOR = {
 };
 const FLOW = ["backlog", "analise", "planejamento", "preparacao", "desenvolvimento", "validacao", "revisao", "concluido"];
 const PRIO = { 1: "Crítica", 2: "Alta", 3: "Normal", 4: "Baixa" };
+const DBKIND = { sqlserver: "SQL Server", postgres: "PostgreSQL", mysql: "MySQL/MariaDB", oracle: "Oracle", outro: "Outro" };
 const STATUS = { na_fila: "Na fila", executando: "Executando", aguardando_aprovacao: "Aguardando você", parado: "Parado", falhou: "Falhou", cancelado: "Cancelado", concluido: "Concluído" };
 const VALID = { ok: "Validação OK", falhou: "Validação falhou", nao_executada: "Sem validação" };
 const LEVEL = { info: "info", aviso: "aviso", erro: "erro", autorizacao: "autorização", sucesso: "sucesso", agente: "agente" };
@@ -748,6 +749,11 @@ VIEWS.demanda = async (r, soft) => {
   if (d.stage === "planejamento" && d.status === "aguardando_aprovacao") actions.push(`<a class="btn warn" href="#/demandas/${d.id}/especificacao">⚑ Revisar especificação</a>`);
   if (d.stage === "revisao") actions.push(`<button class="btn good" data-act="approve-review" data-id="${d.id}">✔ Aprovar e concluir${d.directBranch ? " (aplica na branch)" : ""}</button>`);
   if (d.directBranch && d.baseCommit && ["revisao", "concluido"].includes(d.stage) && !["executando", "na_fila"].includes(d.status)) actions.push(`<button class="btn" data-act="apply-branch" data-id="${d.id}" title="Aplica as alterações da demanda nos arquivos da branch ${esc(d.workBranch)} como alterações pendentes">⤓ Aplicar na branch</button>`);
+  const parado = !["executando", "na_fila"].includes(d.status);
+  // Publicar a branch de desenvolvimento: ação humana, nunca automática (ver pipeline.push).
+  if (d.workBranch && ["revisao", "concluido"].includes(d.stage) && parado) actions.push(`<button class="btn" data-act="push" data-id="${d.id}" title="Faz o commit do que estiver pendente e publica a branch ${esc(d.workBranch)} no servidor">⬆ ${d.pushed ? "Republicar branch" : "Publicar branch"}</button>`);
+  // Enviar para teste só depois de publicada: cria <TIPO>/<TICKET>_stage|release a partir da origem atualizada.
+  if (d.pushed && parado) actions.push(`<button class="btn good" data-act="send-test" data-id="${d.id}" data-project="${d.projectId}" title="Cria a branch de teste a partir de stage/release atualizada e leva os commits da demanda">⚗ ${d.testBranch ? "Reenviar para teste" : "Enviar para teste"}</button>`);
   if (!["backlog"].includes(d.stage) && !["executando", "na_fila"].includes(d.status)) actions.push(`<button class="btn warn" data-act="adjust" data-id="${d.id}">↺ Devolver para ajustes</button>`);
   if (!["executando", "na_fila"].includes(d.status)) actions.push(`<a class="btn ghost" href="#/demandas/${d.id}/editar">✎ Editar</a>`, `<button class="btn ghost" data-act="delete" data-id="${d.id}">🗑</button>`);
 
@@ -759,6 +765,8 @@ VIEWS.demanda = async (r, soft) => {
       <div class="panel"><h2>Dados da missão</h2><dl class="kv">
         <dt>Projeto</dt><dd>${esc(d.projectName)}</dd><dt>Branch base</dt><dd class="mono">${esc(d.baseBranch || "branch atual (definida ao iniciar)")}</dd>
         <dt>Branch de trabalho</dt><dd class="mono">${esc(d.workBranch || (d.directBranch ? "— (a própria branch selecionada)" : "— (criada na Preparação)"))}${d.directBranch ? " · direto na branch" : ""}</dd><dt>Worktree</dt><dd class="mono small">${esc(d.worktreePath || "—")}</dd>
+        <dt>Publicada</dt><dd>${d.pushed ? "sim — branch de desenvolvimento no servidor" : "não — só local"}</dd>
+        <dt>Branch de teste</dt><dd class="mono">${esc(d.testBranch || "—")}</dd>
         <dt>Provedor</dt><dd>${esc(d.provider)}${d.model ? " · " + esc(d.model) : ""}</dd><dt>Prioridade</dt><dd>${badgePrio(d.priority)} · ordem ${d.queueOrder}</dd>
         <dt>Revisão atual</dt><dd>${d.currentRevision}</dd><dt>Tentativas</dt><dd>${d.attempts}</dd><dt>Tempo de execução</dt><dd>${elapsed(d)}</dd>
         <dt>Validação</dt><dd>${badgeValid(d.validationState) || "—"}</dd><dt>Criada em</dt><dd>${fmtDate(d.createdAt)}</dd>
@@ -844,6 +852,72 @@ function adjustModal(id) {
   });
 }
 
+// Envio para teste: escolhe a branch de origem (stage, release...), que é
+// atualizada no servidor antes de a branch de teste nascer dela.
+async function sendTestModal(id, projectId) {
+  openModal(`<h2>⚗ Enviar para teste</h2><div class="help">Carregando as branches do projeto…</div>`);
+  let info;
+  try {
+    info = await api("GET", `/api/projects/${projectId}/branches`);
+  } catch (e) { openModal(`<h2>⚗ Enviar para teste</h2><div class="callout bad">⚠ ${esc(e.message)}</div><div class="row"><button class="btn ghost" data-close>Fechar</button></div>`); return; }
+  const todas = (info.branches || []).map((b) => b.name);
+  // Padrão da equipe: a branch de teste nasce de origin/stage ou origin/release.
+  // Elas aparecem sempre, mesmo fora da lista: Branches() omite a remota quando
+  // a local está em dia, e o servidor resolve origin/<nome> ou a local (ver
+  // pipeline.baseDoTeste).
+  const PADRAO = ["origin/stage", "origin/release"];
+  const conhecida = (n) => todas.includes(n) || todas.includes(n.replace(/^origin\//, ""));
+  const inicial = PADRAO.find(conhecida) || PADRAO[0];
+  openModal(`<h2>⚗ Enviar para teste</h2>
+    <div class="help" style="margin-bottom:12px">A origem escolhida é atualizada (fetch) e a branch de teste nasce do código atual do servidor. Os commits do desenvolvimento são transplantados por cherry-pick; onde houver conflito, o arquivo fica com o código da origem <b>e</b> com as alterações da demanda. Seu checkout não é tocado.</div>
+    <div class="chips" style="margin-bottom:8px">${PADRAO.map((n) => `<span class="chip ${n === inicial ? "on" : ""}" data-target="${esc(n)}">${esc(n)}</span>`).join("")}</div>
+    <label class="f"><span>Branch de origem <em>*</em></span>
+      <input type="text" id="st-target" class="mono" list="st-opts" value="${esc(inicial)}" placeholder="origin/stage" autocomplete="off" spellcheck="false">
+      <datalist id="st-opts"></datalist>
+      <div class="help" id="st-help"></div></label>
+    <label class="f"><span>Nome da branch de teste</span>
+      <input type="text" id="st-nome" class="mono" autocomplete="off" spellcheck="false">
+      <div class="help">Sugerido pela convenção a partir da origem escolhida; pode ser alterado. O trabalho da demanda entra como <b>um commit único</b> (squash) nesta branch.</div></label>
+    <label class="check"><input type="checkbox" id="st-todas"><span>Listar todas as branches do projeto (${todas.length})<br><span class="help">Sem isso, a lista traz só stage e release. O campo aceita digitação em qualquer caso.</span></span></label>
+    <div class="row" style="margin-top:12px"><button class="btn primary" id="st-go">Criar branch de teste</button><button class="btn ghost" data-close>Cancelar</button></div>`);
+  const campo = $("#st-target"), nome = (v) => (v || "").trim().split("/").pop();
+  const opcoes = () => ($("#st-todas").checked ? [...new Set([...PADRAO, ...todas])] : PADRAO);
+  const draw = () => {
+    $("#st-opts").innerHTML = opcoes().map((n) => `<option value="${esc(n)}"></option>`).join("");
+    const v = campo.value.trim(), n = nome(v);
+    $$("[data-target]", $("#modal-box")).forEach((c) => c.classList.toggle("on", c.dataset.target === v));
+    $("#st-help").textContent = !v ? "Informe a branch de origem (ex.: origin/stage)."
+      : conhecida(v) || todas.includes(v) ? `Será criada a branch de teste com o sufixo _${n}.`
+      : `${v} não aparece na lista do projeto. Se existir no servidor, será usada assim mesmo; senão o envio é recusado.`;
+  };
+  // O nome vem do servidor (mesma convenção de gitx.TargetBranchName). Só é
+  // resugerido enquanto o usuário não tiver editado o campo.
+  const nomeCampo = $("#st-nome");
+  let sugerido = "";
+  nomeCampo.addEventListener("input", () => { nomeCampo.dataset.editado = nomeCampo.value !== sugerido ? "1" : ""; });
+  const sugerir = async () => {
+    const alvo = campo.value.trim();
+    if (!alvo || nomeCampo.dataset.editado) return;
+    try {
+      const r = await api("GET", `/api/demands/${id}/test-branch?target=${encodeURIComponent(alvo)}`);
+      sugerido = r.branch || "";
+      if (!nomeCampo.dataset.editado) nomeCampo.value = sugerido;
+    } catch (e) { /* a tela continua utilizável: o servidor sugere de novo ao confirmar */ }
+  };
+  campo.addEventListener("input", draw);
+  campo.addEventListener("change", sugerir);
+  $("#st-todas").addEventListener("change", draw);
+  $$("[data-target]", $("#modal-box")).forEach((c) => c.addEventListener("click", () => { campo.value = c.dataset.target; draw(); sugerir(); }));
+  draw(); sugerir();
+  $("#st-go").addEventListener("click", async () => {
+    const alvo = campo.value.trim();
+    if (!alvo) { campo.focus(); return; }
+    const r = await guarded(() => api("POST", `/api/demands/${id}/send-to-test`, { target: alvo, branch: nomeCampo.value.trim() }));
+    if (r?.message) toast(r.message, "ok");
+    closeModal(); render(true);
+  });
+}
+
 function openModal(html) { $("#modal-box").innerHTML = html; $("#modal").classList.remove("hidden"); }
 function closeModal() { $("#modal").classList.add("hidden"); $("#modal-box").innerHTML = ""; }
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal" || e.target.closest("[data-close]")) closeModal(); });
@@ -858,6 +932,8 @@ document.addEventListener("click", async (e) => {
     if (act === "enqueue") await guarded(() => api("POST", `/api/demands/${id}/enqueue`), "Missão enviada para a fila");
     if (act === "cancel") { if (confirm("Interromper esta missão? O trabalho já feito na branch é preservado.")) await guarded(() => api("POST", `/api/demands/${id}/cancel`), "Cancelamento solicitado"); }
     if (act === "apply-branch") { const r = await guarded(() => api("POST", `/api/demands/${id}/apply-branch`, {})); if (r?.message) toast(r.message, "ok"); }
+    if (act === "push") { const r = await guarded(() => api("POST", `/api/demands/${id}/push`, {})); if (r?.message) toast(r.message, "ok"); render(true); }
+    if (act === "send-test") return sendTestModal(id, +b.dataset.project);
     if (act === "approve-review") { const note = prompt("Aprovar e concluir. Observação (opcional):", ""); if (note !== null) await guarded(() => api("POST", `/api/demands/${id}/approve-review`, { note }), "Missão concluída!"); }
     if (act === "approve-spec") await guarded(() => api("POST", `/api/demands/${id}/approve-spec`, { spec: $("#spec-edit")?.value || "" }), "Especificação aprovada");
     if (act === "adjust") return adjustModal(id);
@@ -883,6 +959,32 @@ document.addEventListener("click", async (e) => {
     render(true);
     return;
   }
+  const novo = e.target.closest("#dbnew");
+  if (novo) return dbServerModal(null);
+  const ed = e.target.closest("[data-dbedit]");
+  if (ed) return dbServerModal((S.dbServers || []).find((x) => x.id === +ed.dataset.dbedit));
+  const rev = e.target.closest("[data-dbreveal]");
+  if (rev) {
+    // a senha só sai do banco aqui, e o acesso fica registrado no log
+    const id = +rev.dataset.dbreveal, alvo = document.getElementById(`pw-${id}`);
+    const r = await guarded(() => api("POST", `/api/db-servers/${id}/reveal`));
+    if (r && alvo) {
+      alvo.textContent = r.password;
+      rev.textContent = "copiar";
+      rev.onclick = () => { navigator.clipboard?.writeText(r.password); toast("Senha copiada", "ok"); };
+      setTimeout(() => { alvo.textContent = "••••••••"; rev.textContent = "ver"; rev.onclick = null; }, 30000);
+    }
+    return;
+  }
+  const del = e.target.closest("[data-dbdel]");
+  if (del) {
+    const d = (S.dbServers || []).find((x) => x.id === +del.dataset.dbdel);
+    if (d && confirm(`Excluir a conexão ${d.name}? A senha guardada é apagada junto.`)) {
+      await guarded(() => api("DELETE", `/api/db-servers/${d.id}`), "Conexão excluída");
+      S.dbServers = await api("GET", "/api/db-servers"); drawDBServers();
+    }
+    return;
+  }
   const card = e.target.closest("[data-open]");
   if (card && !e.target.closest("a,button")) location.hash = `#/demandas/${card.dataset.open}`;
 });
@@ -890,8 +992,9 @@ document.addEventListener("click", async (e) => {
 // ------------------------------------------------------------ 5. PROJETOS
 VIEWS.projetos = async (r) => {
   S.projects = await api("GET", "/api/projects");
+  S.dbServers = await api("GET", "/api/db-servers").catch(() => []);
   const editing = r.id ? S.projects.find((p) => p.id === +r.id) : null;
-  const p = editing || { autoCommit: true, branchOptions: [], standardsFiles: [], agentBashAllow: [] };
+  const p = editing || { autoCommit: true, autoPush: false, branchOptions: [], standardsFiles: [], agentBashAllow: [] };
   $("#view").innerHTML = `
   <div class="page-head"><div><h1><small>Cadastros</small>Projetos</h1><div class="sub">Repositórios Git locais que a IA pode modificar. Cada demanda trabalha em uma worktree isolada — o seu checkout nunca é alterado.</div></div></div>
   <div class="grid g2">
@@ -905,8 +1008,13 @@ VIEWS.projetos = async (r) => {
         <label class="f"><span>Linguagem predominante</span><input type="text" name="language" value="${esc(p.language)}"></label></div>
       <label class="f"><span>Solução / estrutura principal</span><input type="text" name="mainSolution" value="${esc(p.mainSolution)}" placeholder="Ex.: src/Sistema.sln"></label>
       <label class="f"><span>Atalhos de branch base (separados por vírgula)</span><input type="text" name="branchOptions" value="${esc(p.branchOptions.join(", "))}" placeholder="release, main, main_versao, stage"><div class="help">Aparecem como atalhos no cadastro de demandas. Não são obrigatórios nem universais.</div></label>
+      <label class="f"><span>Conexão de banco (catálogo)</span><select name="dbServerId">
+        <option value="0">— nenhuma —</option>
+        ${(S.dbServers || []).map((x) => `<option value="${x.id}" ${(p.dbServerId || 0) === x.id ? "selected" : ""}>${esc(x.name)}${x.host ? " — " + esc(x.host) : ""}</option>`).join("")}
+        </select><div class="help">Apenas referência: indica qual banco este projeto usa. Cadastre as conexões em Configurações. O DevPipe não conecta nem repassa isso à IA.</div></label>
       <div class="grid g2" style="gap:10px"><label class="f"><span>Branches de trabalho</span><div class="help" style="margin-top:6px">Nomeadas pela convenção da equipe: <b class="mono">BUG|FIX|NR/&lt;ticket&gt;_Desenvolvimento</b>. O tipo vem do cadastro de cada demanda.</div></label>
-        <label class="check" style="margin-top:22px"><input type="checkbox" name="autoCommit" ${p.autoCommit ? "checked" : ""}><span>Commit local automático na branch de trabalho<br><span class="help">Nunca faz push nem merge.</span></span></label></div>
+        <div><label class="check" style="margin-top:22px"><input type="checkbox" name="autoCommit" ${p.autoCommit ? "checked" : ""}><span>Commit local automático na branch de trabalho<br><span class="help">Nunca faz merge.</span></span></label>
+        <label class="check" style="margin-top:8px"><input type="checkbox" name="autoPush" ${p.autoPush ? "checked" : ""}><span>Publicar a branch no servidor ao aprovar a revisão<br><span class="help">Push somente da branch da demanda, só por avanço (nunca --force) e só depois da aprovação humana. Exige o commit automático.</span></span></label></div></div>
       <label class="f"><span>Codificação dos arquivos</span><select name="fileEncoding">
         ${[["auto", "Automática — preserva a de cada arquivo; novos seguem a predominante do repositório"], ["windows-1252", "Windows-1252 (ANSI) para arquivos novos"], ["utf-8", "UTF-8 para arquivos novos"], ["utf-8-bom", "UTF-8 com BOM para arquivos novos"]].map(([v, l]) => `<option value="${v}" ${(p.fileEncoding || "auto") === v ? "selected" : ""}>${l}</option>`).join("")}</select>
         <div class="help">Arquivos existentes sempre mantêm a codificação e os finais de linha originais. Arquivos ANSI são convertidos temporariamente para UTF-8 enquanto a IA edita e devolvidos ao original em seguida.</div></label>
@@ -918,6 +1026,9 @@ VIEWS.projetos = async (r) => {
       <div class="row"><button class="btn primary" type="submit">Salvar projeto</button>${editing ? `<a class="btn ghost" href="#/projetos">Novo</a><button type="button" class="btn bad" id="pdel">Excluir</button>` : ""}</div>
     </form></div>`;
   const f = $("#pform");
+  // Publicar exige commit: marcar um liga o outro (o servidor recusa a combinação inválida).
+  f.autoPush.addEventListener("change", () => { if (f.autoPush.checked) f.autoCommit.checked = true; });
+  f.autoCommit.addEventListener("change", () => { if (!f.autoCommit.checked) f.autoPush.checked = false; });
   const inspect = async () => {
     const info = await guarded(() => api("POST", "/api/projects/inspect", { path: f.path.value }));
     $("#pinfo").innerHTML = `<div class="callout ${info.valid ? (info.authorized ? "good" : "warn") : info.needsInit ? "warn" : "bad"} small">${info.valid ? "✔" : info.needsInit ? "ℹ" : "⚠"} <div>${esc(info.message)}${info.valid ? `<br>Branch atual: <b class="mono">${esc(info.current)}</b> · ${info.branches.length} branches · ${info.dirty} alteração(ões) locais${info.standardsFound?.length ? `<br>Arquivos de padrões encontrados: ${info.standardsFound.map(esc).join(", ")}` : ""}` : ""}</div></div>`;
@@ -935,7 +1046,7 @@ VIEWS.projetos = async (r) => {
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const data = { name: f.name.value, path: f.path.value.trim(), language: f.language.value, mainSolution: f.mainSolution.value,
-      branchOptions: f.branchOptions.value.split(",").map((s) => s.trim()).filter(Boolean), autoCommit: f.autoCommit.checked,
+      branchOptions: f.branchOptions.value.split(",").map((s) => s.trim()).filter(Boolean), dbServerId: +f.dbServerId.value || 0, autoCommit: f.autoCommit.checked, autoPush: f.autoPush.checked,
       buildCommand: f.buildCommand.value.trim(), testCommand: f.testCommand.value.trim(), agentBashAllow: lines(f.agentBashAllow.value), fileEncoding: f.fileEncoding.value, standardsFiles: lines(f.standardsFiles.value), extraRules: f.extraRules.value };
     const saved = await guarded(() => api(editing ? "PUT" : "POST", editing ? `/api/projects/${p.id}` : "/api/projects", data), "Projeto salvo");
     location.hash = `#/projetos/${saved.id}`; render();
@@ -1097,6 +1208,7 @@ VIEWS.provedores = async () => {
 // ------------------------------------------------------------ 9. CONFIGURAÇÃO E SEGURANÇA
 VIEWS.config = async () => {
   S.settings = await api("GET", "/api/settings");
+  S.dbServers = await api("GET", "/api/db-servers").catch(() => []);
   const s = S.settings;
   $("#view").innerHTML = `
   <div class="page-head"><div><h1><small>Sistema</small>Configuração geral e segurança</h1><div class="sub">Pasta de dados: <span class="mono">${esc(S.meta.dataDir)}</span> · versão ${esc(S.meta.version)}</div></div></div>
@@ -1112,6 +1224,11 @@ VIEWS.config = async () => {
     </div>
       <h3 style="margin-top:16px">Áreas de trabalho das demandas</h3>
       <label class="f"><span>Pasta onde as branches das demandas são criadas</span><input type="text" name="wtRoot" class="mono" value="${esc(s.worktreeRoot || "")}" placeholder="D:\\repos\\devpipe_demandas"><div class="help">Cada demanda ganha uma worktree Git própria em <span class="mono">&lt;pasta&gt;\\p&lt;projeto&gt;\\&lt;demanda&gt;-&lt;ticket&gt;</span> — é uma cópia do repositório, então use um disco de trabalho e não o perfil do usuário. Vale para demandas <b>novas</b>: as que já começaram continuam onde estão. Vazio = subpasta da pasta de dados.</div></label>
+    </div>
+    <div class="panel hud" id="dbpanel"><h2>Servidores de banco<span class="count">${(S.dbServers || []).length}</span></h2>
+      <div class="help" style="margin-bottom:10px">Catálogo de conexões para consulta da equipe. O DevPipe <b>não conecta</b> no banco, não repassa estes dados à IA e não os usa nos comandos de build/teste — ele apenas guarda. A senha é gravada cifrada; a chave fica em <span class="mono">${esc(S.meta.dataDir)}\chave.bin</span>. Quem tiver acesso à pasta de dados inteira consegue decifrar.</div>
+      <div id="dblist"></div>
+      <button type="button" class="btn sm" id="dbnew">+ Nova conexão</button>
     </div>
     <div class="panel hud"><h2>Segurança</h2>
       <label class="f"><span>Diretórios autorizados (um por linha)</span><textarea name="roots" class="mono" placeholder="C:\\repos">${esc((s.authorizedRoots || []).join("\n"))}</textarea><div class="help">Projetos fora destes diretórios são recusados. Vazio = qualquer repositório cadastrado (não recomendado).</div></label>
@@ -1134,7 +1251,63 @@ VIEWS.config = async () => {
       worktreeRoot: f.wtRoot.value.trim() };
     S.settings = await guarded(() => api("PUT", "/api/settings", st), "Configurações salvas");
   });
+  drawDBServers();
 };
+
+// ---- servidores de banco (somente cadastro; nada é executado com eles)
+function drawDBServers() {
+  const box = $("#dblist");
+  if (!box) return;
+  const list = S.dbServers || [];
+  box.innerHTML = list.length
+    ? `<table class="list"><tr><th>Conexão</th><th>Servidor</th><th>Usuário</th><th>Senha</th><th></th></tr>${list.map((d) => `<tr>
+        <td><b>${esc(d.name)}</b><div class="dim small">${esc(DBKIND[d.kind] || d.kind || "")}${d.notes ? " · " + esc(d.notes) : ""}</div></td>
+        <td class="mono small">${esc(d.host || "—")}${d.port ? ":" + d.port : ""}<div class="dim">${esc(d.database || "")}</div></td>
+        <td class="mono small">${esc(d.username || "—")}</td>
+        <td class="small"><span class="mono" id="pw-${d.id}">${d.hasPassword ? "••••••••" : "—"}</span>
+          ${d.hasPassword ? `<button type="button" class="btn sm ghost" data-dbreveal="${d.id}">ver</button>` : ""}</td>
+        <td><button type="button" class="btn sm" data-dbedit="${d.id}">Editar</button> <button type="button" class="btn sm bad" data-dbdel="${d.id}">🗑</button></td>
+      </tr>`).join("")}</table>`
+    : `<div class="help" style="margin-bottom:10px">Nenhuma conexão cadastrada.</div>`;
+}
+
+function dbServerModal(d) {
+  const novo = !d;
+  d = d || { kind: "sqlserver", port: 0 };
+  openModal(`<h2>${novo ? "Nova conexão de banco" : "Editar conexão"}</h2>
+    <div class="help" style="margin-bottom:12px">Somente cadastro: o DevPipe não abre conexão com este servidor.</div>
+    <div class="grid g2" style="gap:10px">
+      <label class="f"><span>Nome / apelido <em>*</em></span><input type="text" id="db-name" value="${esc(d.name || "")}" placeholder="SISPREV_MS"></label>
+      <label class="f"><span>Tipo</span><select id="db-kind">${Object.entries(DBKIND).map(([v, l]) => `<option value="${v}" ${d.kind === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+    </div>
+    <div class="grid g2" style="gap:10px">
+      <label class="f"><span>Servidor / host</span><input type="text" id="db-host" value="${esc(d.host || "")}" placeholder="srv-sql01"></label>
+      <label class="f"><span>Porta</span><input type="number" id="db-port" min="0" max="65535" value="${d.port || ""}" placeholder="padrão do tipo"></label>
+    </div>
+    <div class="grid g2" style="gap:10px">
+      <label class="f"><span>Banco</span><input type="text" id="db-database" value="${esc(d.database || "")}"></label>
+      <label class="f"><span>Usuário</span><input type="text" id="db-username" value="${esc(d.username || "")}" autocomplete="off"></label>
+    </div>
+    <label class="f"><span>Senha ${novo ? "" : "(em branco mantém a atual)"}</span><input type="password" id="db-password" value="" autocomplete="new-password"></label>
+    <label class="f"><span>Observações</span><input type="text" id="db-notes" value="${esc(d.notes || "")}" placeholder="ex.: somente leitura, homologação"></label>
+    <div class="row" style="margin-top:12px"><button class="btn primary" id="db-save">Salvar</button><button class="btn ghost" data-close>Cancelar</button>
+      ${!novo && d.hasPassword ? `<span class="grow"></span><button class="btn warn" id="db-clear">Apagar a senha guardada</button>` : ""}</div>`);
+  $("#db-name").focus();
+  $("#db-save").addEventListener("click", async () => {
+    const body = {
+      name: $("#db-name").value.trim(), kind: $("#db-kind").value, host: $("#db-host").value.trim(),
+      port: +$("#db-port").value || 0, database: $("#db-database").value.trim(),
+      username: $("#db-username").value.trim(), password: $("#db-password").value, notes: $("#db-notes").value.trim(),
+    };
+    const ok = await guarded(() => novo ? api("POST", "/api/db-servers", body) : api("PUT", `/api/db-servers/${d.id}`, body), "Conexão salva");
+    if (ok) { closeModal(); S.dbServers = await api("GET", "/api/db-servers"); drawDBServers(); }
+  });
+  $("#db-clear")?.addEventListener("click", async () => {
+    if (!confirm(`Apagar a senha guardada de ${d.name}? Os demais dados continuam.`)) return;
+    await guarded(() => api("POST", `/api/db-servers/${d.id}/clear-password`), "Senha apagada");
+    closeModal(); S.dbServers = await api("GET", "/api/db-servers"); drawDBServers();
+  });
+}
 
 VIEWS.notfound = async () => { $("#view").innerHTML = emptyState("Página não encontrada", "", `<a class="btn" href="#/">Voltar à central</a>`); };
 

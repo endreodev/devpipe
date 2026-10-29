@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -34,7 +35,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-const Version = "0.3.1"
+const Version = "0.6.1"
 
 type Server struct {
 	st      *store.Store
@@ -107,6 +108,9 @@ func (s *Server) Handler() http.Handler {
 	h("POST /api/demands/{id}/approve-spec", s.approveSpec)
 	h("POST /api/demands/{id}/approve-review", s.approveReview)
 	h("POST /api/demands/{id}/apply-branch", s.applyBranch)
+	h("POST /api/demands/{id}/push", s.push)
+	h("POST /api/demands/{id}/send-to-test", s.sendToTest)
+	h("GET /api/demands/{id}/test-branch", s.testBranch)
 	h("POST /api/demands/{id}/adjust", s.adjust)
 	h("POST /api/demands/{id}/move", s.move)
 	h("GET /api/demands/{id}/diff", s.diff)
@@ -137,6 +141,13 @@ func (s *Server) Handler() http.Handler {
 	h("POST /api/rules/import", s.importRuleFile)
 	h("GET /api/rules/preview", s.previewRules)
 	h("GET /api/rules/folder", s.checkRuleFolder)
+
+	h("GET /api/db-servers", func(w http.ResponseWriter, r *http.Request) (any, error) { return s.st.ListDBServers() })
+	h("POST /api/db-servers", s.saveDBServer)
+	h("PUT /api/db-servers/{id}", s.saveDBServer)
+	h("DELETE /api/db-servers/{id}", func(w http.ResponseWriter, r *http.Request) (any, error) { return nil, s.st.DeleteDBServer(pid(r)) })
+	h("POST /api/db-servers/{id}/reveal", s.revealDBPassword)
+	h("POST /api/db-servers/{id}/clear-password", s.clearDBPassword)
 
 	h("GET /api/settings", func(w http.ResponseWriter, r *http.Request) (any, error) { return s.st.GetSettings() })
 	h("PUT /api/settings", s.saveSettings)
@@ -379,6 +390,10 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) (any, error
 	}
 	if !filepath.IsAbs(p.Path) {
 		return nil, errors.New("informe o caminho absoluto do repositório")
+	}
+	// Publicar sem commitar não existe: o push leva commits.
+	if p.AutoPush && !p.AutoCommit {
+		return nil, errors.New("para publicar a branch ao aprovar, habilite também o commit automático")
 	}
 	for _, c := range []string{p.BuildCommand, p.TestCommand} { // valida antes de criar qualquer coisa no disco
 		if err := security.CheckValidationCommand(c); err != nil {
@@ -759,7 +774,45 @@ func (s *Server) approveSpec(w http.ResponseWriter, r *http.Request) (any, error
 func (s *Server) approveReview(w http.ResponseWriter, r *http.Request) (any, error) {
 	var in struct{ Note string }
 	decode(r, &in)
-	return nil, s.eng.ApproveReview(pid(r), in.Note)
+	msg, err := s.eng.ApproveReview(pid(r), in.Note)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"message": msg}, nil
+}
+
+// push publica a branch de desenvolvimento da demanda no servidor. Ação
+// humana explícita (botão), também usada para repetir uma publicação que
+// falhou na aprovação.
+func (s *Server) push(w http.ResponseWriter, r *http.Request) (any, error) {
+	msg, err := s.eng.PushWorkBranch(pid(r))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"message": msg}, nil
+}
+
+// sendToTest cria a branch de teste a partir da origem escolhida (stage,
+// release...) com o trabalho da demanda em um commit único. Branch vazio usa
+// a sugestão da convenção.
+func (s *Server) sendToTest(w http.ResponseWriter, r *http.Request) (any, error) {
+	var in struct{ Target, Branch string }
+	decode(r, &in)
+	msg, err := s.eng.SendToTest(pid(r), in.Target, in.Branch)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"message": msg}, nil
+}
+
+// testBranch devolve o nome sugerido da branch de teste para a origem
+// escolhida, para a tela mostrar (e deixar editar) antes de confirmar.
+func (s *Server) testBranch(w http.ResponseWriter, r *http.Request) (any, error) {
+	nome, err := s.eng.TestBranchSuggestion(pid(r), r.URL.Query().Get("target"))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"branch": nome}, nil
 }
 
 func (s *Server) applyBranch(w http.ResponseWriter, r *http.Request) (any, error) {
@@ -1183,4 +1236,69 @@ func (s *Server) fazenda(w http.ResponseWriter, r *http.Request) (any, error) {
 	est := fazenda.Calcular(in, fazenda.Default(settings.MaxParallel), now, time.Local)
 	u, paused := s.eng.Usage()
 	return map[string]any{"estado": est, "uso": u, "filaPausada": now.Before(paused), "versao": Version}, nil
+}
+
+// ------------------------------------------------------------------ servidores de banco
+
+// O DevPipe apenas CATALOGA estas conexões: não conecta no banco, não repassa
+// os dados ao agente e não os injeta nos comandos de validação. A senha é
+// gravada cifrada e nunca volta nas listagens — só pela ação explícita de
+// revelar, que fica registrada no log de eventos.
+
+func (s *Server) saveDBServer(w http.ResponseWriter, r *http.Request) (any, error) {
+	var d domain.DBServer
+	if err := decode(r, &d); err != nil {
+		return nil, err
+	}
+	d.ID = pid(r)
+	d.Name = strings.TrimSpace(d.Name)
+	d.Host, d.Database, d.Username = strings.TrimSpace(d.Host), strings.TrimSpace(d.Database), strings.TrimSpace(d.Username)
+	if d.Name == "" {
+		return nil, errors.New("informe um nome para a conexão")
+	}
+	if d.Kind != "" && !slices.Contains(domain.DBKinds, d.Kind) {
+		return nil, fmt.Errorf("tipo de banco inválido: %q", d.Kind)
+	}
+	if d.Port < 0 || d.Port > 65535 {
+		return nil, errors.New("porta inválida")
+	}
+	novo := d.ID == 0
+	if err := s.st.SaveDBServer(&d); err != nil {
+		return nil, err
+	}
+	acao := "Conexão de banco atualizada: "
+	if novo {
+		acao = "Conexão de banco cadastrada: "
+	}
+	// nome/host/usuário entram no log; a senha, nunca
+	s.eng.SystemLog(domain.LevelInfo, "banco", acao+d.Name+" ("+d.Host+" / "+d.Database+", usuário "+d.Username+")")
+	return d, nil
+}
+
+func (s *Server) revealDBPassword(w http.ResponseWriter, r *http.Request) (any, error) {
+	d, err := s.st.GetDBServer(pid(r))
+	if err != nil {
+		return nil, err
+	}
+	pwd, err := s.st.DBServerPassword(d.ID)
+	if err != nil {
+		return nil, err
+	}
+	if pwd == "" {
+		return nil, errors.New("esta conexão não tem senha guardada")
+	}
+	s.eng.SystemLog(domain.LevelAuth, "banco", "Senha da conexão "+d.Name+" foi exibida na interface")
+	return map[string]string{"password": pwd}, nil
+}
+
+func (s *Server) clearDBPassword(w http.ResponseWriter, r *http.Request) (any, error) {
+	d, err := s.st.GetDBServer(pid(r))
+	if err != nil {
+		return nil, err
+	}
+	if err := s.st.ClearDBServerPassword(d.ID); err != nil {
+		return nil, err
+	}
+	s.eng.SystemLog(domain.LevelWarn, "banco", "Senha da conexão "+d.Name+" foi apagada")
+	return nil, nil
 }

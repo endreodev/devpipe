@@ -207,6 +207,7 @@ func developPrompt(c promptCtx, spec string) string {
 - Você está em uma worktree Git isolada criada para esta demanda. Edite os arquivos diretamente com as ferramentas de edição.
 - Faça alterações pequenas, consistentes e compatíveis com o código existente. Não reescreva arquivos inteiros sem necessidade, não altere configurações fora do escopo e não faça refatorações não solicitadas.
 - Não faça commit, merge, push nem troque de branch: a aplicação cuida do Git.
+- O código que você escreve fica no repositório da equipe: **não** mencione em comentário, docstring, TODO, changelog ou qualquer texto do código que a alteração foi feita por IA, por uma esteira ou por qualquer ferramenta automatizada — nem o nome delas. Comente apenas o que ajuda quem for ler o código depois, no mesmo estilo dos comentários que já existem no projeto.
 - Se houver comandos de build/teste liberados para você, execute-os para verificar seu trabalho. A aplicação também executará a validação oficial depois.
 - Se algo impedir a conclusão, não invente: registre o que foi tentado e o que falta.
 
